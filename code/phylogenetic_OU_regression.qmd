@@ -21,6 +21,7 @@ library(tidyverse)
 library(rstan)
 library(parallel)
 rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())  # Enable parallel Stan sampling
 library(ape)
 library(R.utils)
 library(bridgesampling)
@@ -299,8 +300,9 @@ stan_model_vanilla_corr <- stan_model(model_code = stan_code_vanilla_corr)
 fit_vanilla_corr <- sampling(
     stan_model_vanilla_corr,
     data = stan_data,
-    iter = 10000,
-    chains = 4, 
+    iter = 50000,
+    chains = 4,
+    thin = 10,  # Thinning to reduce autocorrelation
     control = list(adapt_delta = 0.95, max_treedepth = 15)
 )
 print(fit_vanilla_corr, pars = c("mu", "rho"))
@@ -308,12 +310,9 @@ print(fit_vanilla_corr, pars = c("mu", "rho"))
 
 
 ```{r}
-# Apply thinning to show just 10% of the data
-posterior_samples <- as.matrix(fit_vanilla_corr)
-n <- nrow(posterior_samples)
-thin_idx <- seq(1, n, by = ceiling(n / (n * 0.1)))
+
 mcmc_areas(
-    posterior_samples[thin_idx, ],
+    as.matrix(fit_vanilla_corr),
     pars = "rho",
     prob = 0.95
 ) + ggplot2::theme(text = ggplot2::element_text(size = 24))
@@ -344,9 +343,12 @@ loo1 <- loo(log_lik1)
 loo2 <- loo(log_lik2)
 
 # compare
-compare(loo1, loo2)
+loo_compare(loo1, loo2)
 
 ```
+
+So the regression model is slightly preferred, but the difference is almost indistinguishable from zero.
+
 
 ### The Ornstein-Uhlenbeck process
 
@@ -363,3 +365,9 @@ The parameters are:
 - $\lambda$: the rate of convergence to the mean value
 - $\sigma$: the volatility of the process
 - $t$: the time at which the process is evaluated
+
+The long-term equilibrium distribution is:
+$$
+X_t \sim \mathcal N(\mu, \frac{\sigma^2}{2\lambda})
+$$
+
