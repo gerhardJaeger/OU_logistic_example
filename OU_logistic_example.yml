@@ -1,0 +1,17 @@
+name: OU_logistic_example
+channels:
+  - conda-forge
+  - r
+dependencies:
+  - r-base
+  - r-rstan
+  - r-tidyverse
+  - r-ape
+  - r-bayesplot
+  - quarto
+  - jupyter
+  - r-irkernel
+  - r-r.utils
+  - r-bridgesampling
+  - r-loo
+  - r-codetools
