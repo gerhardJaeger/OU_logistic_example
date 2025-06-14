@@ -56,3 +56,14 @@ model {
     y[i] ~ bernoulli_logit(z[i, 2]);
   }
 }
+
+
+generated quantities {
+    vector[N] loglik_x;
+    vector[N] loglik_y;
+
+    for (i in 1:N) {
+        loglik_x[i] = bernoulli_logit_lpmf(x[i] | z[i, 1]);
+        loglik_y[i] = bernoulli_logit_lpmf(y[i] | z[i, 2]);
+    }
+}
