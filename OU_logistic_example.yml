@@ -2,6 +2,7 @@ name: OU_logistic_example
 channels:
   - conda-forge
   - r
+  - bioconda
 dependencies:
   - r-base
   - r-rstan
@@ -15,3 +16,8 @@ dependencies:
   - r-bridgesampling
   - r-loo
   - r-codetools
+  - bioconda::bioconductor-ggtree
+  - r-tidybayes
+  - r-ggthemes
+  - r-paletteer
+  - r-ggnewscale
