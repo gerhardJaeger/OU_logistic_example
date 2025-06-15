@@ -22,3 +22,4 @@ dependencies:
   - r-ggthemes
   - r-paletteer
   - r-ggnewscale
+  - r-cowplot
