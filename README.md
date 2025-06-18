@@ -1,0 +1,1 @@
+You can cite this work as: Gerhard Jäger, 2025, Running a Phylogenetic OU Regression with R and Stan, [![DOI](https://zenodo.org/badge/1001479441.svg)](https://doi.org/10.5281/zenodo.15688716), https://profgerhard.de/OU_logistic_example/phylogenetic_OU_regression.html
