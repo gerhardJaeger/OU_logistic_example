@@ -1,0 +1,2126 @@
+---
+jupyter: ir
+---
+
+
+# Running a Phylogenetic OU Regression with R and Stan
+
+
+
+In this notebook, I will illustrate how one can set up a logistic regression with a phylogenetic random effect following an Ornstein-Uhlenbeck process using R and Stan. 
+
+This kind of analysis has conceptual advantages compared with alternatives - such as phylogenetic random effects following a Brownian motion, or correlated evolution using discrete characters and the CTMC model. However, while there are off-the-shelf solutions for the latter two, the OU regression is, to my knowledge, not yet implemented in a dedicated function or package. Such a model can be set up quite easily in Stan, however. This notebook serves to illustrate how this can be done.
+
+
+## Preparing the environment
+
+The git repository https://github.com/gerhardJaeger/OU_logistic_example holds the source code for this notebook. It contains a file `OU_logistic_example.yml`. You can use it to set up a conda environment containing all the required packages. (Of course you can also install the packages with `install.packages` if you don't use conda.) At the command prompt, in the home directory of the repository, do
+
+```{bash}
+conda env create -f OU_logistic_example.yml
+conda activate OU_logistic_example
+```
+
+## Loading the required packages
+
+```{r}
+#| scrolled: false
+#| vscode: {languageId: r}
+suppressPackageStartupMessages({
+  suppressWarnings({
+    library(tidyverse)
+    library(rstan)
+    library(brms)
+    library(parallel)
+    rstan_options(auto_write = TRUE)
+    options(mc.cores = parallel::detectCores())  # Enable parallel Stan sampling
+    library(ape)
+    library(R.utils)
+    library(bridgesampling)
+    library(loo)
+    library(bayesplot)
+    library(codetools)
+    library(ggtree)
+    library(posterior)
+    library(tidybayes)
+    library(ggthemes)
+    library(paletteer)
+    library(ggnewscale)
+    library(cowplot)
+    options(repr.plot.width = 12, repr.plot.height = 8)  # For base R plots in Jupyter
+    theme_set(theme_minimal(base_size = 24))  # Increase base font size
+  })
+})
+```
+
+## Data
+
+Now let's get some data. I will use the EDGE tree (Bouckaert et al. 2022).
+
+```{r}
+#| vscode: {languageId: r}
+# Create data directory if it doesn't exist
+if (!dir.exists("../data")) dir.create("../data", recursive = TRUE)
+
+# Download the file if it doesn't exist
+tree_gz <- "../data/global-language-tree-MCC-labelled.tree.gz"
+tree_file <- "../data/global-language-tree-MCC-labelled.tree"
+if (!file.exists(tree_file)) {
+    download.file(
+        url = "https://github.com/rbouckaert/global-language-tree-pipeline/releases/download/v1.0.0/global-language-tree-MCC-labelled.tree.gz",
+        destfile = tree_gz,
+        mode = "wb"
+    )
+    R.utils::gunzip(tree_gz, destname = tree_file, overwrite = TRUE)
+    # Remove the gzipped file after extraction
+    if (file.exists(tree_gz)) file.remove(tree_gz)
+}
+
+edge_tree <- read.nexus(tree_file)
+
+edge_tree$tip.label <- sapply(strsplit(edge_tree$tip.label, "_"), `[`, 1)
+```
+
+It is advisable to rescale the tree so that the mean branch length is 1.
+
+```{r}
+#| vscode: {languageId: r}
+edge_tree$edge.length <- edge_tree$edge.length / (mean(edge_tree$edge.length))
+```
+
+## Grambank data
+
+I will look at the somewhat boring feature pair:
+
+- GB193: What is the order of adnominal property word and noun?
+- GB133: Is a pragmatically unmarked constituent order verb-final for transitive clauses?
+
+
+
+First we get the grambank data.
+
+```{r}
+#| vscode: {languageId: r}
+grambank_file = "../data/grambank_vals.csv"
+if (!file.exists(grambank_file)) {
+    values_url <- "https://raw.githubusercontent.com/grambank/grambank/refs/heads/master/cldf/values.csv"
+    vals <- read_csv(values_url, na = "")
+    write(vals, grambank_file)
+} else {
+    vals <- read_csv(grambank_file)
+}
+```
+
+Now we filter out the datapoints for the two parameters of interest and the languages in the tree. I only consider two values per parameter, and only languages having a relevant value for both parameters.
+
+```{r}
+#| vscode: {languageId: r}
+d <- vals %>%
+    filter(Language_ID %in% edge_tree$tip.label) %>%
+    filter(Parameter_ID %in% c("GB193", "GB133")) %>%
+    select(Language_ID, Parameter_ID, Value) %>%
+    filter(Value %in% c(0, 1, 2)) %>%
+    mutate(Value = as.numeric(Value)) %>%
+    pivot_wider(names_from = Parameter_ID, values_from = Value) %>%
+    filter(GB193 > 0) %>%
+    drop_na()
+```
+
+Now we prune the tree to only include the languages in the data.
+
+```{r}
+#| vscode: {languageId: r}
+pruned_tree <- drop.tip(edge_tree, setdiff(edge_tree$tip.label, d$Language_ID))
+
+# Check that d$Language_ID and pruned_tree$tip.label are the same set
+if (!setequal(d$Language_ID, pruned_tree$tip.label)) {
+    warning("Mismatch between d$Language_ID and pruned_tree$tip.label")
+    print(setdiff(d$Language_ID, pruned_tree$tip.label))
+    print(setdiff(pruned_tree$tip.label, d$Language_ID))
+} else {
+    message("d$Language_ID and pruned_tree$tip.label match.")
+}
+```
+
+Now the rows in `d` are rearranged to match the order of the tips in the pruned tree.
+
+```{r}
+#| vscode: {languageId: r}
+d <- d[match(pruned_tree$tip.label, d$Language_ID), ]
+```
+
+Finally we convert the features to numeric values, and convert to 0/1
+
+```{r}
+#| vscode: {languageId: r}
+d <- d %>%
+    mutate(x = GB193 - 1,
+           y = GB133 
+    )
+```
+
+
+For now, I keep the data set small and restrict myself to 100 taxa.
+
+```{r}
+#| vscode: {languageId: r}
+set.seed(123)  # You can replace 123 with any integer
+d <- d[sample(nrow(d), 100), ]
+pruned_tree <- drop.tip(pruned_tree, setdiff(pruned_tree$tip.label, d$Language_ID))
+d <- d[match(pruned_tree$tip.label, d$Language_ID), ]
+```
+
+Let's have a look at the tree and the data.
+
+```{r}
+#| vscode: {languageId: r}
+ggtree(pruned_tree, layout="circular") +
+    geom_tree() +
+    geom_tiplab() +            # Adds tip labels
+    theme_tree2()              # Adds scale axis (x-axis for branch lengths)
+
+
+d %>% head(10)
+```
+
+## Stan model
+
+The tree is represented as a phylo object in `ape`, which is suitable for Stan.
+
+Just to be on the safe side, we make sure that the branches are in postorder.
+
+```{r}
+#| vscode: {languageId: r}
+pruned_tree <- reorder(pruned_tree, "postorder")
+```
+
+Now we code the tree and the data as a data list.
+
+```{r}
+#| vscode: {languageId: r}
+stan_data = list(
+    N = nrow(d),  # Number of languages
+    Nnodes = length(unique(as.vector(pruned_tree$edge))),
+    root_node = length(pruned_tree$tip.label) + 1,
+    x = d$x,  # Predictor variable (numeral-noun order)
+    y = d$y,  # Response variable (adnominal demonstrative-noun order)
+    Nedges = nrow(pruned_tree$edge), # number of edges
+    edges = pruned_tree$edge,  # Edges of the tree,
+    edge_lengths = pruned_tree$edge.length  # Lengths of the edges
+)
+```
+
+### Vanilla logistic regression
+
+We start with a simple logistic regression without any phylogenetic effects, just to see how it works.
+
+The model formula is:
+
+$$
+\begin{align}
+\alpha &\sim \mathcal N(0, 2)\\
+\beta &\sim \text{Student-t}(3, 0, 2.5)\\
+\mu_x &:= \frac{1}{|x|}\sum_{i}x_i\\
+y &\sim \text{Bernoulli}(\text{logit}^{-1}(\alpha + \beta (x-\mu_x)))
+\end{align}
+$$
+
+The choice of priors follows the defaults used by brms for logistic regression.
+
+Let's run this in Stan.
+
+```{r}
+#| vscode: {languageId: r}
+stan_code_vanilla <- "
+data {
+    int<lower=1> N;                      // Number of observations
+    vector<lower=0, upper=1>[N] x;       // Predictor variable
+    array[N] int<lower=0,upper=1> y;     // Response variable (binary)
+}
+
+transformed data {
+  vector[N] Xc;  // centered version of X without an intercept
+  real means_X;  // mean of X before centering
+  means_X = mean(x);
+  Xc = x - means_X;
+}
+
+parameters {
+    real alpha;      // Intercept
+    real beta;       // Slope
+}
+model {
+    // Priors
+    alpha ~ student_t(3, 0, 2.5);
+    beta ~ normal(0, 2);
+
+    // Likelihood
+    y ~ bernoulli_logit(alpha + beta * Xc);
+}
+generated quantities {
+    vector[N] log_lik;
+    array[N] int y_rep;      // Posterior predictive samples
+    array[N] int y_prior;    // Prior predictive samples
+
+    for (n in 1:N) {
+        // Log-likelihood
+        log_lik[n] = bernoulli_logit_lpmf(y[n] | alpha + beta * x[n]);
+
+        // Posterior predictive
+        y_rep[n] = bernoulli_logit_rng(alpha + beta * Xc[n]);
+
+        // Prior predictive: draw new alpha and beta from prior, then simulate
+        real alpha_prior = student_t_rng(3, 0, 2.5);
+        real beta_prior = normal_rng(0, 2);
+        y_prior[n] = bernoulli_logit_rng(alpha_prior + beta_prior * Xc[n]);
+    }
+}
+"
+stan_model_vanilla <- stan_model(model_code = stan_code_vanilla)
+```
+
+```{r}
+#| vscode: {languageId: r}
+
+fit_vanilla <- sampling(stan_model_vanilla, data = stan_data, iter = 2000, chains = 4)
+```
+
+```{r}
+#| vscode: {languageId: r}
+print(fit_vanilla, pars = c("alpha", "beta"))
+```
+
+```{r}
+#| vscode: {languageId: r}
+mcmc_areas(
+    as.matrix(fit_vanilla),
+    pars="beta",
+    prob = 0.95
+)
+```
+
+The posterior distribution of the slope $\beta$ does not include zero, indicating that there is a significant relationship between the predictor variable `x` and the response variable `y`. The direction is negative, meaning that N-ANM order disfavors OV order.
+
+
+For model comparison, we can use the `bridgesampling` package to compute the log marginal likelihood.
+
+```{r}
+#| vscode: {languageId: r}
+capture.output({
+  log_marginal_likelihood_vanilla_regression <- bridge_sampler(fit_vanilla)
+}, file = "/dev/null")
+
+print(log_marginal_likelihood_vanilla_regression)
+```
+
+Now we do visual checks of the model using prior and posterior predictive simulations.
+
+```{r}
+#| vscode: {languageId: r}
+predictive_checks_regression <- function(y_prior, y_rep, stan_data) {
+  library(dplyr)
+  library(ggplot2)
+
+  # Index positions for x = 0 and x = 1
+  x0_idx <- which(stan_data$x == 0)
+  x1_idx <- which(stan_data$x == 1)
+
+  # Prior predictive means
+  p_y1_given_x0 <- rowMeans(y_prior[, x0_idx, drop = FALSE])
+  p_y1_given_x1 <- rowMeans(y_prior[, x1_idx, drop = FALSE])
+
+  # Posterior predictive means
+  p_y1_rep_x0 <- rowMeans(y_rep[, x0_idx, drop = FALSE])
+  p_y1_rep_x1 <- rowMeans(y_rep[, x1_idx, drop = FALSE])
+
+  # Observed proportions
+  obs_p_y1_x0 <- mean(stan_data$y[stan_data$x == 0])
+  obs_p_y1_x1 <- mean(stan_data$y[stan_data$x == 1])
+
+  # Construct tidy dataframes
+  df_sim <- data.frame(
+    x = rep(c("x = 0", "x = 1"), each = length(p_y1_given_x0)),
+    p_y1 = c(p_y1_given_x0, p_y1_given_x1),
+    source = "prior"
+  )
+
+  df_post <- data.frame(
+    x = rep(c("x = 0", "x = 1"), each = length(p_y1_rep_x0)),
+    p_y1 = c(p_y1_rep_x0, p_y1_rep_x1),
+    source = "posterior"
+  )
+
+  df_obs <- data.frame(
+    x = c("x = 0", "x = 1"),
+    p_y1 = c(obs_p_y1_x0, obs_p_y1_x1),
+    source = "observed"
+  )
+
+  # Combine all
+  df_all <- bind_rows(df_sim, df_post, df_obs)
+  df_all_density <- df_all %>%
+    filter(source != "observed") %>%
+    group_by(source, x) %>%
+    filter(n() >= 2) %>%
+    ungroup()
+
+  # Plot
+    p <- ggplot(df_all_density, aes(x = p_y1, fill = source, color = source)) +
+    geom_density(alpha = 0.3, adjust = 1.2) +
+    geom_vline(data = df_obs, aes(xintercept = p_y1, color = source),
+                linetype = "dashed", size = 1) +
+    facet_wrap(~x, nrow = 1) +
+    scale_fill_manual(values = c("prior" = "skyblue", "posterior" = "seagreen")) +
+    scale_color_manual(values = c("prior" = "skyblue4", "posterior" = "darkgreen", "observed" = "red")) +
+    labs(
+        title = "Predictive Check: Prior vs Posterior vs Observed",
+        x = "Proportion of y = 1 (per draw)",
+        y = "Density"
+    ) +
+    theme_minimal(base_size = 14)
+
+
+  return(p)
+}
+```
+
+```{r}
+#| vscode: {languageId: r}
+post_vanilla_regression <- rstan::extract(fit_vanilla)
+
+predictive_checks_regression(post_vanilla_regression$y_rep, post_vanilla_regression$y_prior, stan_data)
+```
+
+### Vanilla logistic correlation study
+
+A regression model assumes an asymmetry between the predictor variable (which is not modeled) and the response variabel (which is modeled). This is not really justified in observational studies where we have not control over the predictor variable. A more appropriate model is one where both variables are generated by some stochastic process. 
+
+This can be modeled as follows:
+
+$$	
+\begin{align}
+z &\sim \mathcal N(\mu, R)\\
+R &\sim \text{LKJ}(2)\\
+\mu_k &= \mathcal N(0, 2)\\
+x &\sim \text{Bernoulli}(\text{logit}^{-1}(z_1))\\
+y &\sim \text{Bernoulli}(\text{logit}^{-1}(z_2))
+\end{align}
+$$
+
+Here $z$ is a bivariate normal variable with mean $\mu$ and covariance $R$. The two components of $z$ have standard deviations 1, and the correlation between them is given by $\rho = R_{12} = R_{21}$. The correlation matrix is generated from a uniform distribution distribution, which is a flexible way to model correlations. The two variables $x$ and $y$ are then generated from the first and second components of $z$, respectively, using the logistic function. 
+
+The interesting question is then whether the correlation between $x$ and $y$, i.e., $\rho = r_{21}$, is significantly different from zero. If it is, this indicates that there is a significant correlation between the two variables, which is what we are interested in.
+
+```{r}
+#| vscode: {languageId: r}
+stan_code_vanilla_corr <- "
+data {
+  int<lower=0> N;
+  array[N] int<lower=0, upper=1> x;       // first binary variable
+  array[N] int<lower=0, upper=1> y;       // second binary variable
+}
+
+parameters {
+  vector[2] mu;                          // Mean of latent variables
+  cholesky_factor_corr[2] L_R;           // Cholesky factor of correlation matrix
+  matrix[2, N] z_raw;                    // Standard normal latent variables
+}
+
+transformed parameters {
+  real rho = L_R[2, 1];                  // Extract the correlation coefficient from the Cholesky factor
+  matrix[2, N] z;                        // Latent variables with correlation
+  z = rep_matrix(mu, N) + L_R * z_raw;   // Transform raw latent variables to correlated latent variables
+}
+
+model {
+  // Priors
+  mu ~ normal(0, 2);                       // Prior for the mean of latent variables
+  L_R ~ lkj_corr_cholesky(2);              // Prior for the Cholesky factor of the correlation matrix
+  to_vector(z_raw) ~ normal(0, 1);         // standard normal prior for latent
+
+  // Likelihood
+  for (n in 1:N) {
+    x[n] ~ bernoulli_logit(z[1, n]);
+    y[n] ~ bernoulli_logit(z[2, n]);
+  }
+}
+
+generated quantities {
+  vector[N] log_lik_x;
+  vector[N] log_lik_y;
+  array[N] int x_rep;
+  array[N] int y_rep;
+  array[N] int x_prior;
+  array[N] int y_prior;
+
+  for (n in 1:N) {
+    log_lik_x[n] = bernoulli_logit_lpmf(x[n] | z[1, n]);
+    log_lik_y[n] = bernoulli_logit_lpmf(y[n] | z[2, n]);
+    x_rep[n] = bernoulli_logit_rng(z[1, n]);
+    y_rep[n] = bernoulli_logit_rng(z[2, n]);
+  }
+
+  // Prior predictive simulation
+  {
+    vector[2] mu_prior;
+    mu_prior[1] = normal_rng(0, 2);
+    mu_prior[2] = normal_rng(0, 2);
+
+    matrix[2, 2] R_prior = diag_matrix(rep_vector(1.0, 2));  // identity matrix
+    matrix[2, 2] L_prior = cholesky_decompose(R_prior);
+    matrix[2, N] z_raw_prior;
+    matrix[2, N] z_prior;
+
+    for (n in 1:N)
+      for (d in 1:2)
+        z_raw_prior[d, n] = normal_rng(0, 1);
+
+    z_prior = rep_matrix(mu_prior, N) + L_prior * z_raw_prior;
+
+    for (n in 1:N) {
+      x_prior[n] = bernoulli_logit_rng(z_prior[1, n]);
+      y_prior[n] = bernoulli_logit_rng(z_prior[2, n]);
+    }
+  }
+}
+
+"
+stan_model_vanilla_corr <- stan_model(model_code = stan_code_vanilla_corr)
+```
+
+```{r}
+#| vscode: {languageId: r}
+fit_vanilla_corr <- sampling(
+    stan_model_vanilla_corr,
+    data = stan_data,
+    iter = 2000,
+    chains = 4
+)
+```
+
+```{r}
+#| vscode: {languageId: r}
+print(fit_vanilla_corr, pars = c("mu", "rho"))
+```
+
+```{r}
+#| vscode: {languageId: r}
+mcmc_areas(
+    as.matrix(fit_vanilla_corr),
+    pars = "rho",
+    prob = 0.95
+)
+```
+
+The posterior of $\rho$ includes 0, so no clear evidence for a correlation. 
+
+
+### predictive checks
+
+We compare the behavior of data sampled from the prior, and data sampled from the posterior, to the observed data.
+
+First check: proportion of 1s in the $x$-variable
+
+```{r}
+#| vscode: {languageId: r}
+predictive_check_marginal_binary <- function(x_prior, x_rep, x_obs,
+                                             varname = "x", bins = 30) {
+  library(ggplot2)
+  library(dplyr)
+
+  # Compute posterior and prior predictive means (per draw)
+  post_prop <- rowMeans(x_rep)
+  prior_prop <- rowMeans(x_prior)
+  obs_prop <- mean(x_obs)
+
+  # Combine into tidy data frame
+  df <- data.frame(
+    prop = c(prior_prop, post_prop),
+    source = rep(c("prior", "posterior"), times = c(length(prior_prop), length(post_prop)))
+  )
+
+  # Plot
+  ggplot(df, aes(x = prop, fill = source)) +
+    geom_histogram(position = "identity", alpha = 0.4, bins = bins) +
+    geom_vline(xintercept = obs_prop, color = "red", linetype = "dashed", linewidth = 1) +
+    labs(
+      title = paste("Sanity Check:", varname, "~ Bernoulli"),
+      x = paste("Proportion of", varname, "= 1 (per draw)"),
+      y = "Frequency"
+    ) +
+    scale_fill_manual(values = c("prior" = "skyblue", "posterior" = "seagreen")) +
+    theme_minimal(base_size = 14)
+}
+```
+
+```{r}
+#| vscode: {languageId: r}
+post_vanilla_corr <- rstan::extract(fit_vanilla_corr)
+predictive_check_marginal_binary(
+  x_prior = post_vanilla_corr$x_prior,
+  x_rep = post_vanilla_corr$x_rep,
+  x_obs = stan_data$x,
+  varname = "x"
+)
+```
+
+Second check: conditional probability $(y=1|x_{\text{observed}}=0)$ and $(y=1|x_{\text{observed}}=1)$
+
+```{r}
+#| vscode: {languageId: r}
+predictive_checks_regression(post_vanilla_corr$y_rep, post_vanilla_corr$y_prior, stan_data)
+```
+
+For both checks, the prior is close to a uniform distribution, and the posterior is peaked around the empirical values. This is as it should be.
+
+### model comparison
+
+We compute the log marginal likelihood for this model for later use.
+
+```{r}
+#| vscode: {languageId: r}
+capture.output({
+    log_marginal_likelihood_vanilla_corr <- bridge_sampler(fit_vanilla_corr)
+}, file = "/dev/null")
+print(log_marginal_likelihood_vanilla_corr)
+```
+
+A direct model comparison via Bayes Factor is not possible because the regression model models the distribution of `x` given `y`, while the correlation models the joint distribution. However, we can apply Pareto-smoothed leave one out cross-validation if we marginalize over `x` in the correlation model.
+
+```{r}
+#| vscode: {languageId: r}
+# extract log-likelihood matrix: draws x observations
+log_lik1 <- extract_log_lik(fit_vanilla, parameter_name = "log_lik")
+log_lik2 <- extract_log_lik(fit_vanilla_corr, parameter_name = "log_lik_y")
+
+# compute LOO
+loo1 <- loo(log_lik1)
+loo2 <- loo(log_lik2)
+
+
+loo_list <- list(
+    "vanilla_regression" = loo1, 
+    "vanilla_correlation" = loo2
+  )
+
+# compare
+loo_compare(loo_list)
+```
+
+So the correlation model is slightly preferred, but the difference is fairly small.
+
+
+### The Ornstein-Uhlenbeck process
+
+
+The OU process is a stochastic process, similar to Brownian motion. The crucial difference is that OU is ``random walk on a leash``. Technically, it is the mixture of a stochastic Brownian motion process and a deterministic trajectory exponentially converging to a mean value. It is characterized by the following distribution:
+$$
+X_t \sim \mathcal N\left(x_0e^{-\lambda t} + \mu (1-e^{-\lambda t}), \frac{\sigma}{\sqrt{2\lambda}}\sqrt{1-e^{-2\lambda t}}\right)
+$$
+
+The parameters are:
+
+- $x_0$: the initial value of the process
+- $\mu$: the mean value to which the process converges
+- $\lambda$: the rate of convergence to the mean value
+- $\sigma$: the volatility of the process
+- $t$: the time at which the process is evaluated
+
+The long-term equilibrium distribution is:
+$$
+X_t \sim \mathcal N(\mu, \frac{\sigma}{\sqrt{2\lambda}})
+$$
+
+## Logistic regression with a phylogenetic random effect
+
+We now add a phylogenetic random effect to the logistic regression from above:
+
+
+$$
+\begin{align}
+\alpha &\sim \text{Student-t}(3, 0, 2.5)\\
+\beta &\sim \mathcal N(0, 2)\\
+\epsilon &\sim \mathcal N(0, \Sigma)\\
+y &\sim \text{Bernoulli}(\text{logit}^{-1}(\alpha + \beta x + \epsilon))
+\end{align}
+$$
+
+The covariance matrix $\Sigma$ of the phylogenetic random effect is given by
+
+$$
+\Sigma_{ij} = \frac{\sigma^2}{2\lambda} e^{-\lambda t_{ij}},
+$$
+
+where $t_{ij}$ is the patristic distance between language $i$ and language $j$ in the phylogeny.
+
+
+A direct implementation of this formula in Stan is possible but inefficient. A better approach directly simulates the evolution of the latent variable $\epsilon$ along the phylgeny. This means that $\epsilon$ has a value not only at the tips but also at the internal nodes. The value at the root is sampled from the equilibrium distribution, and the value of the other nodes is drawn from the equation above, repeated here:
+
+$$
+X_t \sim \mathcal N(x_0e^{-\lambda t} + \mu (1-e^{-\lambda t}), \frac{\sigma^2}{2\lambda}(1-e^{-2\lambda t})).
+$$
+
+$X_t$ is now the value at the daughter node, $x_0$ at the mother node, and $t$ is the branch length.
+
+```{r}
+#| vscode: {languageId: r}
+stan_model_code_OU_regression = "
+data {
+  int<lower=1> N;                                         // number of tips with data
+  int<lower=1> Nnodes;                                    // total number of nodes
+  int<lower=1> Nedges;                                    // number of edges in the tree
+  vector<lower=0, upper=1>[N] x;                          // predictor at tips
+  array[N] int<lower=0, upper=1> y;                       // binary response at tips
+  array[Nedges, 2] int<lower=1, upper=Nnodes> edges;      // parent → child
+  vector<lower=0>[Nedges] edge_lengths;                   // edge lengths
+  int<lower=1, upper=Nnodes> root_node;                   // index of root node
+}
+transformed data {
+  vector[N] Xc;  // centered version of X without an intercept
+  real means_X;  // mean of X before centering
+  means_X = mean(x);
+  Xc = x - means_X;
+}
+
+
+parameters {
+  vector[Nnodes] z_std;       // standard normal reparam for latent z
+  real<lower=0> sigma;        // OU diffusion
+  real<lower=0> lambda;       // OU strength
+  real mu;                    // OU mean
+  real alpha;                 // intercept
+  real beta;                  // slope
+}
+
+transformed parameters {
+  vector[Nnodes] z;
+
+  // root node
+  z[root_node] = mu + (sigma / sqrt(2 * lambda)) * z_std[root_node];
+
+  // recursive evolution
+  for (e in 1:Nedges) {
+    int edge_index = Nedges - e + 1; // reverse order for recursion
+    int parent = edges[edge_index, 1];
+    int child = edges[edge_index, 2];
+    real len = edge_lengths[edge_index];
+
+    real decay = exp(-lambda * len);
+    real s = sigma * sqrt(-expm1(-2 * lambda * len) / (2 * lambda));
+    real mn = mu + (z[parent] - mu) * decay;
+
+    z[child] = mn + s * z_std[child];
+  }
+}
+
+model {
+  // Priors
+  alpha ~ student_t(3, 0, 2.5);
+  beta ~ normal(0, 2);
+  sigma ~ lognormal(0, 1);
+  lambda ~ lognormal(0, 1);
+  mu ~ normal(0, 2);
+  z_std ~ normal(0, 1);  // standard normal prior
+
+  // Likelihood
+  for (i in 1:N) {
+    y[i] ~ bernoulli_logit(alpha + beta * Xc[i] + z[i]);
+  }
+}
+
+generated quantities {
+  vector[N] log_lik;
+  array[N] int y_rep;     // posterior predictive
+  array[N] int y_prior;   // prior predictive
+
+  // Posterior predictive samples (uses fitted alpha, beta, z)
+  for (i in 1:N) {
+    real eta = alpha + beta * Xc[i] + z[i];
+    log_lik[i] = bernoulli_logit_lpmf(y[i] | eta);
+    y_rep[i] = bernoulli_logit_rng(eta);
+  }
+
+  // Prior predictive samples: draw alpha, beta, z_prior from prior
+  {
+    real alpha_prior = student_t_rng(3, 0, 2.5);
+    real beta_prior = normal_rng(0, 2);
+
+    vector[Nnodes] z_prior_std;
+    for (j in 1:Nnodes)
+      z_prior_std[j] = normal_rng(0, 1);
+
+    real mu_prior = normal_rng(0, 2);
+    real lambda_prior = lognormal_rng(0, 1);
+    real sigma_prior = lognormal_rng(0, 1);
+
+    vector[Nnodes] z_prior;
+    z_prior[root_node] = mu_prior + (sigma_prior / sqrt(2 * lambda_prior)) * z_prior_std[root_node];
+
+    for (e in 1:Nedges) {
+      int edge_index = Nedges - e + 1;
+      int parent = edges[edge_index, 1];
+      int child = edges[edge_index, 2];
+      real len = edge_lengths[edge_index];
+      real decay = exp(-lambda_prior * len);
+      real s = sigma_prior * sqrt(-expm1(-2 * lambda_prior * len) / (2 * lambda_prior));
+      real mn = mu_prior + (z_prior[parent] - mu_prior) * decay;
+      z_prior[child] = mn + s * z_prior_std[child];
+    }
+
+    for (i in 1:N) {
+      real eta_prior = alpha_prior + beta_prior * Xc[i] + z_prior[i];
+      y_prior[i] = bernoulli_logit_rng(eta_prior);
+    }
+  }
+}
+
+"
+stan_model_OU_regression <- stan_model(model_code = stan_model_code_OU_regression)
+```
+
+```{r}
+#| scrolled: false
+#| vscode: {languageId: r}
+fit_OU_regression <- sampling(
+    stan_model_OU_regression,
+    data = stan_data,
+    iter = 2000,
+    chains = 4,
+    control = list(adapt_delta = 0.95, max_treedepth = 15)
+)
+```
+
+```{r}
+#| vscode: {languageId: r}
+print(fit_OU_regression, pars = c("mu", "sigma", "lambda", "alpha", "beta"))
+```
+
+```{r}
+#| vscode: {languageId: r}
+mcmc_areas(
+    as.matrix(fit_OU_regression),
+    pars = "beta",
+    prob = 0.95
+)
+```
+
+### predictive checks
+
+We perform the same predictive checks as for the regression model above.
+
+```{r}
+#| vscode: {languageId: r}
+post_ou_regression <- rstan::extract(fit_OU_regression)
+predictive_checks_regression(post_ou_regression$y_rep, post_ou_regression$y_prior, stan_data)
+```
+
+This looks perfect - the prior is essentially flat, and the posterior is peaked around the obverved value.
+
+### model comparison
+
+```{r}
+#| vscode: {languageId: r}
+capture.output({
+    log_marginal_likelihood_OU_regression <- bridge_sampler(fit_OU_regression)
+}, file = "/dev/null")
+print(log_marginal_likelihood_OU_regression)
+```
+
+Now we can compute the Bayes factor between the vanilla regression and the OU phylogenetic regression.
+
+```{r}
+#| vscode: {languageId: r}
+log_marginal_likelihood_OU_regression$logml - log_marginal_likelihood_vanilla_regression$logml
+```
+
+This is extremely strong evidence in favor of the OU model.
+
+The HPD for $\beta$ is very broad and includes 0. So there is no evidence for the significant effect of the order of adnominal property words on verb position.
+
+
+
+### Brownian motion
+
+Next I will fit a logistic regression with a Brownian-motion phylogenetic random effect.
+
+```{r}
+#| vscode: {languageId: r}
+A <- ape::vcv(pruned_tree, corr = TRUE)
+d$Language_ID <- factor(d$Language_ID, levels = rownames(A))
+```
+
+```{r}
+#| vscode: {languageId: r}
+fit_brownian_regression <- brm(
+  formula = y ~ x + (1 | gr(Language_ID, cov = A)),
+  data = d,
+  family = bernoulli(link = "logit"),
+  prior = c(
+    prior(normal(0, 2), class = "b")
+  ),
+  data2 = list(A = A),
+  control = list(adapt_delta = 0.95),
+  cores = 4,
+  chains = 4,
+  save_pars = save_pars(all = TRUE)
+)
+```
+
+```{r}
+#| vscode: {languageId: r}
+summary(fit_brownian_regression)
+```
+
+```{r}
+#| vscode: {languageId: r}
+mcmc_areas(
+    as.matrix(fit_brownian_regression),
+    pars = "b_x",
+    prob = 0.95
+)
+```
+
+The HPD interval for the slope includes 0, so there is no credible evidence for an impact of x on y.
+
+
+### predictive checks
+
+In a brms model, one cannot do prior predictive simulations while model fitting. Instead, we have to fit the model again, this time with `sample_prior = "only"`.
+
+```{r}
+#| vscode: {languageId: r}
+y_rep_brownian_regression <- posterior_predict(fit_brownian_regression)       # matrix: draws × observations
+
+fit_prior <- brm(
+  formula = y ~ x + (1 | gr(Language_ID, cov = A)),
+  data = d,
+  family = bernoulli(),
+  data2 = list(A = A),
+  prior = c(
+    prior(normal(0, 2.5), class = "b")
+  ),
+  sample_prior = "only",
+  control = list(adapt_delta = 0.95),
+  cores = 4, chains = 4
+)
+```
+
+```{r}
+#| vscode: {languageId: r}
+y_prior_brownian_regression <- posterior_predict(fit_prior)
+predictive_checks_regression(y_rep_brownian_regression, y_prior_brownian_regression, stan_data)
+```
+
+The priors and posteriors look healthy.
+
+### model comparison
+
+```{r}
+#| vscode: {languageId: r}
+capture.output({
+    log_marginal_likelihood_brownian_regression <- bridge_sampler(fit_brownian_regression)
+}, file = "/dev/null")
+print(log_marginal_likelihood_brownian_regression)
+```
+
+```{r}
+#| vscode: {languageId: r}
+log_marginal_likelihood_OU_regression$logml - log_marginal_likelihood_brownian_regression$logml
+```
+
+The OU model is favored over the Brownian-motion model by a wide margin.
+
+Next we look as PSIS-LOOCV
+
+```{r}
+#| vscode: {languageId: r}
+# extract log-likelihood matrix: draws x observations
+
+log_lik3 <- extract_log_lik(fit_OU_regression, parameter_name = "log_lik")
+log_lik4 <- log_lik(fit_brownian_regression)
+
+
+# compute LOO
+
+loo3 <- loo(log_lik3)
+loo4 <- loo(log_lik4)
+
+loo_list$OU_regression <- loo3
+loo_list$brownian_regression <- loo4
+
+# compare
+loo_compare(loo_list)
+```
+
+So both Bayes Factor and PSIS-LOOCV favor OU over Brownian motion, and they favor both versions with phylogenetic control over models without phylogenetic control.
+
+So much about various flavors of regression.
+
+However, I find it hard to wrap my mind around what such a model actually means. It says that there is a latent variable $\epsilon$ evolving along the tree, and the probability of a language being verb final depends both on this latent variable and on the order of adjective-noun.
+
+A more realistic model, it seems to me, is one where there are
+
+- a latent variable determining adjective-noun order, and
+- a latent variable determining verb position.
+
+These latent variables evolve simultaneously along the tree. If there is a dependency between the two observed variables resulting from diachronic processes, there is a correlation between the diachronic changes of the variables.
+
+This can be implemented in an extension of the bivariate correlation model used above.
+
+The model specification is as follows, where $N$ is the number of languages, and $t_{l_1, l_2}$ is the length of from the root of the tree to the most recent common ancestor of $l_1$ and $l_2$:
+
+$$	
+\begin{align}
+R &\sim \text{LKJ}(2)\\
+\Sigma_{(l_1, k_1), (l_2, k_2)} &= R_{k_1, k_2}\cdot \frac{\sigma_{k_1}\sigma_{k_2}}{\lambda_{k_1}+\lambda_{k_2}}\left(1-e^{-(\lambda_{k_1}+\lambda_{k_2})t_{l_1, l_2}}\right)
+\\
+\mu_i &= \mathcal N(\mathbf 0, 2)\\
+\sigma_i &= \text{Lognormal}(0,1)\\
+\lambda_i &= \text{Lognormal}(0,1)\\
+z &\sim \mathcal N(\text{repeat}(\mu, N), \Sigma)\\
+x_i &\sim \text{Bernoulli}(\text{logit}^{-1}(z_{i,1}))\\
+y_i &\sim \text{Bernoulli}(\text{logit}^{-1}(z_{i,2}))
+\end{align}
+$$
+
+```{r}
+#| vscode: {languageId: r}
+stan_code_OU_correlation <- "
+data {
+  int<lower=1> N;                                        // number of tips with data
+  int<lower=1> Nnodes;                                   // total number of nodes
+  int<lower=1> Nedges;                                   // number of edges in the tree
+  array[N] int<lower=0, upper=1> x;                      // first binary response
+  array[N] int<lower=0, upper=1> y;                      // second binary response
+  array[Nedges, 2] int<lower=1, upper=Nnodes> edges;     // parent → child
+  vector<lower=0>[Nedges] edge_lengths;                  // edge lengths
+  int<lower=1, upper=Nnodes> root_node;                  // index of root node
+}
+
+parameters {
+  matrix[Nnodes, 2] z_std;                   // standard-normal latent variables
+  vector<lower=0>[2] sigma;                  // OU diffusion parameters
+  vector<lower=0>[2] lambda;                 // OU pull strengths
+  vector[2] mu;                              // OU stationary means
+  cholesky_factor_corr[2] L_std;             // Cholesky factor of correlation matrix
+}
+
+transformed parameters {
+  matrix[Nnodes, 2] z;     // latent values
+  real rho = L_std[2, 1];  // correlation coefficient
+
+  // Root node, drawn from OU stationary distribution
+  z[root_node] = (mu + (sigma ./ sqrt(2 * lambda)) .* (L_std * to_vector(z_std[root_node])))';
+
+
+
+  // Recursive evolution
+  for (e in 1:Nedges) {
+    int edge_index = Nedges - e + 1;   // reverse order for recursion, root to tips
+    int parent = edges[edge_index, 1];
+    int child  = edges[edge_index, 2];
+    real len = edge_lengths[edge_index];
+
+    // Vectorized decay and scale
+    vector[2] decay = exp(-lambda * len);
+    vector[2] s = sigma .* sqrt(-expm1(-2 * lambda * len) ./ (2 * lambda));
+    vector[2] mean = mu + (to_vector(z[parent]) - mu) .* decay;
+    vector[2] eps  = L_std * z_std[child]';
+    z[child] = (mean + s .* eps)';
+  }
+}
+
+model {
+  // Priors
+  sigma ~ lognormal(0, 1);
+  lambda ~ lognormal(0, 1);
+  mu ~ normal(0, 2);
+  L_std ~ lkj_corr_cholesky(2.0);
+  to_vector(z_std) ~ normal(0, 1);
+
+  // Likelihood
+  for (i in 1:N) {
+    x[i] ~ bernoulli_logit(z[i, 1]);
+    y[i] ~ bernoulli_logit(z[i, 2]);
+  }
+}
+
+
+generated quantities {
+  vector[N] log_lik_x;
+  vector[N] log_lik_y;
+  array[N] int x_rep;
+  array[N] int y_rep;
+  array[N] int x_prior;
+  array[N] int y_prior;
+
+  // Posterior predictive
+  for (i in 1:N) {
+    x_rep[i] = bernoulli_logit_rng(z[i, 1]);
+    y_rep[i] = bernoulli_logit_rng(z[i, 2]);
+    log_lik_x[i] = bernoulli_logit_lpmf(x[i] | z[i, 1]);
+    log_lik_y[i] = bernoulli_logit_lpmf(y[i] | z[i, 2]);
+  }
+
+  // Prior predictive simulation
+  {
+    vector[2] mu_prior;
+    vector[2] sigma_prior;
+    vector[2] lambda_prior;
+    matrix[2, 2] L_prior;
+    matrix[Nnodes, 2] z_std_prior;
+    matrix[Nnodes, 2] z_prior;
+
+    for (j in 1:2) {
+      mu_prior[j] = normal_rng(0.0, 2.0);
+      sigma_prior[j] = lognormal_rng(0.0, 1.0);
+      lambda_prior[j] = lognormal_rng(0.0, 1.0);
+    }
+    L_prior = cholesky_decompose(lkj_corr_rng(2, 2.0));
+
+    for (i in 1:Nnodes)
+      z_std_prior[i] = to_row_vector(normal_rng(rep_vector(0.0, 2), rep_vector(1.0, 2)));
+
+    // Root node
+    z_prior[root_node] = (mu_prior + (sigma_prior ./ sqrt(2 * lambda_prior)) .* (L_prior * to_vector(z_std_prior[root_node])))';
+
+    // Recursion
+    for (e in 1:Nedges) {
+      int edge_index = Nedges - e + 1;
+      int parent = edges[edge_index, 1];
+      int child  = edges[edge_index, 2];
+      real len = edge_lengths[edge_index];
+
+      vector[2] decay = exp(-lambda_prior * len);
+      vector[2] s = sigma_prior .* sqrt(-expm1(-2 * lambda_prior * len) ./ (2 * lambda_prior));
+      vector[2] mean = mu_prior + (to_vector(z_prior[parent]) - mu_prior) .* decay;
+      vector[2] eps = L_prior * z_std_prior[child]';
+      z_prior[child] = (mean + s .* eps)';
+    }
+
+    for (i in 1:N) {
+      x_prior[i] = bernoulli_logit_rng(z_prior[i, 1]);
+      y_prior[i] = bernoulli_logit_rng(z_prior[i, 2]);
+    }
+  }
+
+  // Simulate using posterior parameters but fresh noise z_std_prior
+  array[N] int x_replicated_noise;
+  array[N] int y_replicated_noise;
+  {
+    matrix[Nnodes, 2] z_std_resample;
+    matrix[Nnodes, 2] z_resample;
+
+    for (i in 1:Nnodes)
+      z_std_resample[i] = to_row_vector(normal_rng(rep_vector(0.0, 2), rep_vector(1.0, 2)));
+
+    // Root node
+    z_resample[root_node] = (mu + (sigma ./ sqrt(2 * lambda)) .* (L_std * to_vector(z_std_resample[root_node])))';
+
+    // Recursion
+    for (e in 1:Nedges) {
+      int edge_index = Nedges - e + 1;
+      int parent = edges[edge_index, 1];
+      int child  = edges[edge_index, 2];
+      real len = edge_lengths[edge_index];
+
+      vector[2] decay = exp(-lambda * len);
+      vector[2] s = sigma .* sqrt(-expm1(-2 * lambda * len) ./ (2 * lambda));
+      vector[2] mean = mu + (to_vector(z_resample[parent]) - mu) .* decay;
+      vector[2] eps = L_std * z_std_resample[child]';
+      z_resample[child] = (mean + s .* eps)';
+    }
+
+    for (i in 1:N) {
+      x_replicated_noise[i] = bernoulli_logit_rng(z_resample[i, 1]);
+      y_replicated_noise[i] = bernoulli_logit_rng(z_resample[i, 2]);
+    }
+  }
+
+}
+
+"
+stan_model_OU_correlation <- stan_model(model_code = stan_code_OU_correlation)
+```
+
+```{r}
+#| vscode: {languageId: r}
+fit_OU_correlation <- sampling(
+    stan_model_OU_correlation,
+    data = stan_data,
+    iter = 10000,
+    thin = 10,
+    chains = 4,
+    control = list(adapt_delta = 0.95, max_treedepth = 15)
+)
+```
+
+```{r}
+#| vscode: {languageId: r}
+print(fit_OU_correlation, pars=c("mu", "sigma", "lambda", "rho"))
+```
+
+```{r}
+#| vscode: {languageId: r}
+mcmc_areas(
+    as.matrix(fit_OU_correlation),
+    pars = "rho",
+    prob = 0.95
+)
+```
+
+Since the HPD of $\rho$ includes 0, we conclude that there is no credible evidence for a diachronic correlation between the two variables.
+
+### predictive checks
+
+```{r}
+#| vscode: {languageId: r}
+post_OU_correlation <- rstan::extract(fit_OU_correlation)
+
+predictive_check_marginal_binary(
+  x_prior = post_OU_correlation$x_prior,
+  x_rep = post_OU_correlation$x_rep,
+  x_obs = stan_data$x,
+  varname = "x"
+)
+```
+
+```{r}
+#| vscode: {languageId: r}
+predictive_checks_regression(post_OU_correlation$y_rep, post_OU_correlation$y_prior, stan_data)
+```
+
+The prior and posterior simulations look okay.
+
+It seems tempting to also use the posterior predictive simulation to estimate the equilibrium probabilities. However, this would be wrong because the posterior predictive simulation also use the posterior of the latent variable z. Instead, we have to use the posterior of the other parameters and to simulate z to obtain the posterior prediction for a copy of the tree, without regard for the real history of the tree.
+
+I added a block to this effect in the Stan code, producing `x_replicated_noise` and `y_replicated_noise`.
+
+```{r}
+#| vscode: {languageId: r}
+x_replicated_noise = post_OU_correlation$x_replicated_noise
+y_replicated_noise = post_OU_correlation$y_replicated_noise
+
+
+# Create a function to compute joint probabilities for one sample
+joint_freqs <- function(x, y) {
+  tab <- table(factor(x, levels = 0:1), factor(y, levels = 0:1))
+  as.vector(tab) / length(x)  # returns proportions in order: (0,0), (0,1), (1,0), (1,1)
+}
+
+# Apply over all 2000 posterior samples
+joint_probs <- t(mapply(joint_freqs, 
+                        split(x_replicated_noise, row(x_replicated_noise)), 
+                        split(y_replicated_noise, row(y_replicated_noise))))
+
+colnames(joint_probs) <- c("(0,0)", "(0,1)", "(1,0)", "(1,1)")
+
+x_range = c(0,1)
+df <- as.data.frame(joint_probs) %>%
+  mutate(draw = 1:n()) %>%
+  pivot_longer(-draw, names_to = "Combination", values_to = "Probability")
+
+ggplot(df, aes(x = Probability, fill = Combination)) +
+  geom_density(alpha = 0.6) +
+  facet_wrap(~ Combination, scales = "fixed") +  # enforce same scale
+  scale_x_continuous(limits = x_range) +         # set common x-axis limits
+  theme_minimal() +
+  labs(title = "Equilibrium Distribution of Joint Outcomes",
+       x = "Estimated Probability",
+       y = "Density")
+```
+
+### model comparison
+
+
+Bayes factor:
+
+```{r}
+#| vscode: {languageId: r}
+capture.output({
+    log_marginal_likelihood_OU_correlation <- bridge_sampler(
+        fit_OU_correlation, silent = TRUE, maxiter = 10000
+    )
+  }, file = "/dev/null"
+)
+print(log_marginal_likelihood_OU_correlation)
+```
+
+```{r}
+#| vscode: {languageId: r}
+log_marginal_likelihood_OU_correlation$logml - log_marginal_likelihood_vanilla_corr$logml
+```
+
+Again we find overwhelming evidence in favor of the phylogenetic model.
+
+We can complement model comparison via Bayes Factor with Pareto-smoothed leave-one-out cross-validation.
+
+```{r}
+#| scrolled: true
+#| vscode: {languageId: r}
+# extract log-likelihood matrix: draws x observations
+
+log_lik5 <- extract_log_lik(fit_OU_correlation, parameter_name = "log_lik_y")
+
+
+# compute LOO
+
+loo5 <- loo(log_lik5)
+
+loo_list$OU_correlation <- loo5
+
+# compare
+loo_compare(loo_list)
+```
+
+The three phylogenetic models perform massively better than the vanilla models. Furthermore if our goal is to predict the verb position of an unseen language from its noun-adjective order and its position in the tree, the OU regression model is superior to the correlation model.
+
+As a nice side effect of the explicit modeling of the diachronic histories, we can plot the posterior means of the latent variables at the internal nodes, thereby visualizing the evolution of the latent variables. 
+
+```{r}
+#| vscode: {languageId: r}
+posterior_df <- as_draws_df(fit_OU_correlation)
+z_posterior <- posterior_df %>%
+  spread_draws(z[i, j]) %>%
+  group_by(i, j) %>%
+  summarise(mean_z = mean(z), .groups = "drop")
+z_adjective <- z_posterior %>%
+    filter(j == 1) %>%
+    pull(mean_z)
+z_vo <- z_posterior %>%
+    filter(j == 2) %>%
+    pull(mean_z)
+pruned_tree$node.label <- as.character(
+    (length(pruned_tree$tip.label) + 1):(length(pruned_tree$tip.label) + pruned_tree$Nnode)
+)
+
+
+tree_plot <- ggtree(pruned_tree)
+tree_info <- tree_plot$data
+tree_info$node.label <- as.character(tree_info$label)
+```
+
+```{r}
+#| vscode: {languageId: r}
+for (i in 1:nrow(tree_info)) {
+    if (tree_info$isTip[i]) {
+        # If it's a tip, get the corresponding Glottocode
+        glottocode <- tree_info$label[i]
+        # Find the index of the Glottocode in d_ie
+        index <- which(pruned_tree$tip.label == glottocode)
+        # Assign the Affix value to the node label
+        tree_info$node.label[i] <- index
+    } else {
+        # If it's not a tip, copy label
+        tree_info$node.label[i] <- as.integer(tree_info$node.label[i])
+    }
+}
+
+
+node_data <- tibble(
+  node.label = as.character(1:length(z_adjective)),
+  z_adjective = z_adjective,
+  z_vo = z_vo
+)
+
+
+tree_data <- tree_info %>%
+  left_join(node_data, by = "node.label")
+
+tree_data <- tree_data %>%
+    left_join(
+        rename(select(d, Language_ID, GB193, GB133),
+        label=Language_ID)
+    ) 
+tree_data <- tree_data %>%
+  mutate(GB193 = factor(GB193)) %>%
+  mutate(GB133 = factor(GB133))
+```
+
+```{r}
+#| vscode: {languageId: r}
+
+custom_palette <- paletteer_c("scico::roma", 30)
+```
+
+```{r}
+#| vscode: {languageId: r}
+p1 <- ggtree(pruned_tree, layout = "circular", branch.length = "none") %<+% tree_data +
+  geom_tree(aes(color = plogis(z_adjective)), size = 1) +
+  scale_color_gradientn(colors = custom_palette, name = "p(NAdj)") +
+  ggnewscale::new_scale_color() +
+  geom_tippoint(aes(color = GB193), size = 3) +
+  scale_color_manual(values = c("1" = custom_palette[1], "2" = custom_palette[30])) +
+  guides(color = guide_legend(override.aes = list(size = 4))) +
+  theme(
+    legend.position = "left",
+    plot.margin = margin(0, 0, 0, 0),
+    text = element_text(size = 18),
+    legend.text = element_text(size = 18)
+  )
+```
+
+```{r}
+#| vscode: {languageId: r}
+p2 <- ggtree(pruned_tree, layout = "circular", branch.length = "none") %<+% tree_data +
+  geom_tree(aes(color = plogis(z_vo)), size = 1) +
+  scale_color_gradientn(colors = custom_palette, name = "p(VO)") +
+  ggnewscale::new_scale_color() +
+  geom_tippoint(aes(color = GB133), size = 3) +
+  scale_color_manual(values = c("0" = custom_palette[1], "1" = custom_palette[30])) +
+  guides(color = guide_legend(override.aes = list(size = 4))) +
+  theme(
+    plot.margin = margin(0, 0, 0, 0),
+    text = element_text(size = 18),
+    legend.text = element_text(size = 18)
+  )
+```
+
+```{r}
+#| vscode: {languageId: r}
+options(repr.plot.width = 18, repr.plot.height = 10) 
+plot_grid(p1, p2, ncol = 2, align = "hv", axis = "tb", rel_widths = c(1, 1))
+
+```
+
+```{r}
+#| vscode: {languageId: r}
+options(repr.plot.width = 12, repr.plot.height = 8)  # For base R plots in Jupyter
+```
+
+Another advantage of this approach (both the regression and the correlation variant) is that it can easily be combined with family-level or macroarea-level random effects. Also, geographic random effects can easily be added.
+
+More details can be found in my arxiv paper *Computational Tyology* (https://arxiv.org/abs/2504.15642)
+
+## Pagel & Meade style test for correlation
+
+The test for correlation using CTMC, as developed by Pagel & Meade (2006) and implemented in BayesTraits, can also be implemented in Stan, using Felsenstein's pruning algorithm.
+
+```{r}
+#| vscode: {languageId: r}
+stan_modelcode_ctmc_independent = "
+data {
+  int<lower=1> N;                                     // number of tips with data
+  int<lower=1> Nnodes;                                // total number of nodes
+  int<lower=1> Nedges;                                // number of edges in the tree
+  array[N] int<lower=0, upper=1> x;                   // first variable
+  array[N] int<lower=0, upper=1> y;                   // second variable
+  array[Nedges, 2] int<lower=1, upper=Nnodes> edges;  // parent → child
+  vector<lower=0>[Nedges] edge_lengths;               // edge lengths
+  int<lower=1, upper=Nnodes> root_node;               // index of root node
+}
+
+parameters {
+// parameters of the CTMCs
+  vector<lower=0>[2] rates;
+  simplex[2] pi_1;
+  simplex[2] pi_2;
+}
+
+transformed parameters {
+  // Q matrices
+  matrix[2, 2] Q1;
+  matrix[2, 2] Q2;
+
+  Q1[1,1] = -rates[1] * pi_1[2];
+  Q1[1,2] =  rates[1] * pi_1[2];
+  Q1[2,1] =  rates[1] * pi_1[1];
+  Q1[2,2] = -rates[1] * pi_1[1];
+
+  Q2[1,1] = -rates[2] * pi_2[2];
+  Q2[1,2] =  rates[2] * pi_2[2];
+  Q2[2,1] =  rates[2] * pi_2[1];
+  Q2[2,2] = -rates[2] * pi_2[1];
+
+  // matrices for Felsenstein recursion
+  matrix[Nnodes, 2] loglikelihood_x;
+  matrix[Nnodes, 2] loglikelihood_y;
+
+  // initialize loglikelihood matrices with log(0)
+  for (n in 1:Nnodes) {
+    loglikelihood_x[n] = rep_row_vector(negative_infinity(), 2);
+    loglikelihood_y[n] = rep_row_vector(negative_infinity(), 2);
+  }
+
+  // set the loglikelihoods for the tips
+  for (i in 1:N) {
+    loglikelihood_x[i, x[i] + 1] = 0;
+    loglikelihood_y[i, y[i] + 1] = 0;
+  }
+
+  // recursive computation of loglikelihoods
+  for (e in 1:Nedges) {
+    int parent = edges[e, 1];
+    int child = edges[e, 2];
+    real t = edge_lengths[e];
+
+    matrix[2,2] P1 = matrix_exp(Q1 * t);
+    matrix[2,2] P2 = matrix_exp(Q2 * t);
+
+    for (k in 1:2) {
+      loglikelihood_x[parent, k] = log_sum_exp(to_vector(log(P1[k]) + loglikelihood_x[child]));
+      loglikelihood_y[parent, k] = log_sum_exp(to_vector(log(P2[k]) + loglikelihood_y[child]));
+    }
+  }
+}
+
+model {
+  rates ~ lognormal(-1, 0.5);
+  pi_1 ~ dirichlet(rep_vector(2, 2));
+  pi_2 ~ dirichlet(rep_vector(2, 2));
+
+  target += log_sum_exp(loglikelihood_x[root_node] + log(pi_1)');
+  target += log_sum_exp(loglikelihood_y[root_node] + log(pi_2)');
+}
+
+generated quantities {
+  vector[N] x_log_lik = rep_vector(0.0, N);
+  vector[N] y_log_lik = rep_vector(0.0, N);
+  array[N] int x_rep;
+  array[N] int y_rep;
+  array[N] int x_prior;
+  array[N] int y_prior;
+  matrix[Nnodes, 2] ll_x;
+  matrix[Nnodes, 2] ll_y;
+  
+  for (n in 1:Nnodes) {
+    ll_x[n] = rep_row_vector(negative_infinity(), 2);
+    ll_y[n] = rep_row_vector(negative_infinity(), 2);
+  }
+  
+  for (j in 1:N) {
+     int xj = x[j];
+     int yj = y[j];
+     ll_x[j, xj + 1] = 0;
+     ll_y[j, yj + 1] = 0;
+  }
+
+  for (e in 1:Nedges) {
+        int parent = edges[e, 1];
+        int child = edges[e, 2];
+        real t = edge_lengths[e];
+        matrix[2,2] P1 = matrix_exp(Q1 * t);
+        matrix[2,2] P2 = matrix_exp(Q2 * t);
+
+        for (k in 1:2) {
+          ll_x[parent, k] = log_sum_exp(to_vector(log(P1[k]) + ll_x[child]));
+          ll_y[parent, k] = log_sum_exp(to_vector(log(P2[k]) + ll_y[child]));
+        }
+   }
+   real full_loglik_x = log_sum_exp(ll_x[root_node] + log(pi_1)');
+   real full_loglik_y = log_sum_exp(ll_y[root_node] + log(pi_2)');
+
+   for (i in 1:N) {
+      // initialize with log(0)
+      for (n in 1:Nnodes) {
+        ll_x[n] = rep_row_vector(negative_infinity(), 2);
+        ll_y[n] = rep_row_vector(negative_infinity(), 2);
+      }
+
+      // flip x[i] and y[i]
+      for (j in 1:N) {
+        int xj = (j == i) ? 1 - x[j] : x[j];
+        int yj = (j == i) ? 1 - y[j] : y[j];
+        ll_x[j, xj + 1] = 0;
+        ll_y[j, yj + 1] = 0;
+      }
+
+      // recurse up the tree
+      for (e in 1:Nedges) {
+        int parent = edges[e, 1];
+        int child = edges[e, 2];
+        real t = edge_lengths[e];
+        matrix[2,2] P1 = matrix_exp(Q1 * t);
+        matrix[2,2] P2 = matrix_exp(Q2 * t);
+
+        for (k in 1:2) {
+          ll_x[parent, k] = log_sum_exp(to_vector(log(P1[k]) + ll_x[child]));
+          ll_y[parent, k] = log_sum_exp(to_vector(log(P2[k]) + ll_y[child]));
+        }
+      }
+
+      real flip_loglik_x = log_sum_exp(ll_x[root_node] + log(pi_1)');
+      real flip_loglik_y = log_sum_exp(ll_y[root_node] + log(pi_2)');
+      x_log_lik[i] = log_softmax([full_loglik_x, flip_loglik_x]')[1];
+      y_log_lik[i] = log_softmax([full_loglik_y, flip_loglik_y]')[1];
+    }
+  
+
+
+  // Posterior predictive simulation
+  {
+    array[Nnodes] int latent_x;
+    array[Nnodes] int latent_y;
+    latent_x[root_node] = categorical_rng(pi_1);
+    latent_y[root_node] = categorical_rng(pi_2);
+
+    for (edge_idx in 1:Nedges) {
+      int edge_idx_b = Nedges + 1 - edge_idx;
+      int parent = edges[edge_idx_b, 1];
+      int child = edges[edge_idx_b, 2];
+      real t = edge_lengths[edge_idx_b];
+
+      matrix[2, 2] P1 = matrix_exp(Q1 * t);
+      matrix[2, 2] P2 = matrix_exp(Q2 * t);
+
+      int p1 = latent_x[parent];
+      int p2 = latent_y[parent];
+
+      if (p1 >= 1 && p1 <= 2) {
+        latent_x[child] = categorical_rng(to_vector(P1[p1]));
+      } else {
+        latent_x[child] = categorical_rng(rep_vector(0.5, 2));
+      }
+
+      if (p2 >= 1 && p2 <= 2) {
+        latent_y[child] = categorical_rng(to_vector(P2[p2]));
+      } else {
+        latent_y[child] = categorical_rng(rep_vector(0.5, 2));
+      }
+    }
+
+    for (n in 1:N) {
+      x_rep[n] = latent_x[n] - 1;
+      y_rep[n] = latent_y[n] - 1;
+    }
+  }
+
+  // Prior predictive simulation
+  {
+    vector[2] pi1_prior = dirichlet_rng(rep_vector(2.0, 2));
+    vector[2] pi2_prior = dirichlet_rng(rep_vector(2.0, 2));
+    real rate1 = lognormal_rng(-1, 0.5);
+    real rate2 = lognormal_rng(-1, 0.5);
+
+    matrix[2, 2] Q1p;
+    matrix[2, 2] Q2p;
+
+    Q1p[1,1] = -rate1 * pi1_prior[2];
+    Q1p[1,2] =  rate1 * pi1_prior[2];
+    Q1p[2,1] =  rate1 * pi1_prior[1];
+    Q1p[2,2] = -rate1 * pi1_prior[1];
+
+    Q2p[1,1] = -rate2 * pi2_prior[2];
+    Q2p[1,2] =  rate2 * pi2_prior[2];
+    Q2p[2,1] =  rate2 * pi2_prior[1];
+    Q2p[2,2] = -rate2 * pi2_prior[1];
+
+    array[Nnodes] int latent_x;
+    array[Nnodes] int latent_y;
+    latent_x[root_node] = categorical_rng(pi1_prior);
+    latent_y[root_node] = categorical_rng(pi2_prior);
+
+    for (edge_idx in 1:Nedges) {
+      int edge_idx_b = Nedges + 1 - edge_idx;
+      int parent = edges[edge_idx_b, 1];
+      int child = edges[edge_idx_b, 2];
+      real t = edge_lengths[edge_idx_b];
+      matrix[2, 2] P1 = matrix_exp(Q1p * t);
+      matrix[2, 2] P2 = matrix_exp(Q2p * t);
+
+      int p1 = latent_x[parent];
+      int p2 = latent_y[parent];
+
+      if (p1 >= 1 && p1 <= 2) {
+        latent_x[child] = categorical_rng(to_vector(P1[p1]));
+      } else {
+        latent_x[child] = categorical_rng(rep_vector(0.5, 2));
+      }
+
+      if (p2 >= 1 && p2 <= 2) {
+        latent_y[child] = categorical_rng(to_vector(P2[p2]));
+      } else {
+        latent_y[child] = categorical_rng(rep_vector(0.5, 2));
+      }
+    }
+
+    for (n in 1:N) {
+      x_prior[n] = latent_x[n] - 1;
+      y_prior[n] = latent_y[n] - 1;
+    }
+  }
+}
+
+
+"
+stan_model_ctmc_independent <- stan_model(model_code=stan_modelcode_ctmc_independent)
+```
+
+```{r}
+#| vscode: {languageId: r}
+fit_ctmc_independent <- sampling(
+    stan_model_ctmc_independent,
+    data = stan_data,
+    iter = 2000,
+    chains = 4
+)
+```
+
+```{r}
+#| vscode: {languageId: r}
+print(fit_ctmc_independent, pars=c("pi_1", "pi_2", "rates"))
+```
+
+### predictive checks
+
+```{r}
+#| vscode: {languageId: r}
+post_ctmc_independent <- rstan::extract(fit_ctmc_independent)
+predictive_check_marginal_binary(
+  x_prior = post_ctmc_independent$x_prior,
+  x_rep = post_ctmc_independent$x_rep,
+  x_obs = stan_data$x,
+  varname = "x"
+)
+```
+
+```{r}
+#| vscode: {languageId: r}
+predictive_checks_regression(post_ctmc_independent$y_rep, post_ctmc_independent$y_prior, stan_data)
+```
+
+The predictive checks indicate that the prior is already quite informative (which is bad), and the posterior hardly differs from the prior (which is also bad).
+
+```{r}
+#| vscode: {languageId: r}
+capture.output({
+    log_marginal_likelihood_ctmc_independent <- bridge_sampler(fit_ctmc_independent)
+}, file = "/dev/null")
+print(log_marginal_likelihood_ctmc_independent)
+```
+
+```{r}
+#| vscode: {languageId: r}
+stan_modelcode_ctmc_dependent = "
+functions {
+  vector stationary_distribution(matrix Q) {
+    int K = rows(Q);
+    matrix[K, K] A = Q';
+    vector[K] b = rep_vector(0.0, K);
+    
+    // Replace one row by sum-to-one constraint
+    A[K] = rep_row_vector(1.0, K);
+    b[K] = 1.0;
+
+    return mdivide_left(A, b);  // solve A * pi = b
+  }
+}
+
+
+data {
+  int<lower=1> N;
+  int<lower=1> Nnodes;
+  int<lower=1> Nedges;
+  array[N] int<lower=0, upper=1> x;
+  array[N] int<lower=0, upper=1> y;
+  array[Nedges, 2] int<lower=1, upper=Nnodes> edges;
+  vector<lower=0>[Nedges] edge_lengths;
+  int<lower=1, upper=Nnodes> root_node;
+}
+
+transformed data {
+   array[N] int z;
+   for (i in 1:N) {
+      z[i] = 2* x[i] + y[i];
+   }
+}
+
+parameters {
+  real<lower=0> total_rate;
+  simplex[8] rates;
+}
+
+transformed parameters {
+  // Q matrices
+  matrix[4, 4] Q;
+  Q[1,1] = -rates[1] - rates[2];
+  Q[1,2] = rates[1];
+  Q[1,3] = rates[2];
+  Q[1,4] = 0;
+  Q[2,1] = rates[3];
+  Q[2,2] = -rates[3] - rates[4];
+  Q[2,3] = 0;
+  Q[2,4] = rates[4];
+  Q[3,1] = rates[5];
+  Q[3,2] = 0;
+  Q[3,3] = -rates[5] - rates[6];
+  Q[3,4] = rates[6];
+  Q[4,1] = 0;
+  Q[4,2] = rates[7];
+  Q[4,3] = rates[8];
+  Q[4,4] = -rates[7] - rates[8];
+  Q = total_rate * Q;
+
+  vector[4] pi = stationary_distribution(Q);
+
+  matrix[Nnodes, 4] loglikelihood;
+
+  for (n in 1:Nnodes) {
+    loglikelihood[n] = rep_row_vector(negative_infinity(), 4);
+  }
+
+  for (i in 1:N) {
+    loglikelihood[i, z[i] + 1] = 0;
+  }
+
+  for (e in 1:Nedges) {
+    int parent = edges[e, 1];
+    int child = edges[e, 2];
+    real t = edge_lengths[e];
+
+    matrix[4,4] P = matrix_exp(Q * t);
+
+    for (k in 1:4) {
+      loglikelihood[parent, k] = log_sum_exp(to_vector(log(P[k]) + loglikelihood[child]));
+    }
+  }
+}
+
+model {
+  total_rate ~ gamma(1, 1);
+  rates ~ dirichlet(rep_vector(1, 8));
+
+  target += log_sum_exp(loglikelihood[root_node] + log(pi)');
+}
+
+generated quantities {
+  vector[N] x_log_lik;
+  vector[N] y_log_lik;
+  array[N] int x_rep;
+  array[N] int y_rep;
+  array[N] int x_prior;
+  array[N] int y_prior;
+
+  {
+    matrix[Nnodes, 4] ll;
+    real loglik;
+    real loglik_flipped;
+    for (n in 1:Nnodes)
+        ll[n] = rep_row_vector(negative_infinity(), 4);
+
+    for (j in 1:N)
+      ll[j, z[j] + 1] = 0;
+
+    for (e in 1:Nedges) {
+      int parent = edges[e, 1];
+      int child  = edges[e, 2];
+      real t = edge_lengths[e];
+      matrix[4,4] P = matrix_exp(Q * t);
+      for (k in 1:4)
+        ll[parent, k] = log_sum_exp(to_vector(log(P[k]) + ll[child]));
+    }
+
+    loglik = log_sum_exp(ll[root_node] + log(pi)');
+
+    for (i in 1:N) {
+      // --- x_i flipped ---
+      for (n in 1:Nnodes)
+        ll[n] = rep_row_vector(negative_infinity(), 4);
+
+      for (j in 1:N) {
+        int zj = z[j];
+        if (j == i) {
+          // flip x but keep y
+          if (zj == 0) zj = 2;
+          else if (zj == 1) zj = 3;
+          else if (zj == 2) zj = 0;
+          else if (zj == 3) zj = 1;
+        }
+        ll[j, zj + 1] = 0;
+      }
+
+      for (e in 1:Nedges) {
+        int parent = edges[e, 1];
+        int child  = edges[e, 2];
+        real t = edge_lengths[e];
+        matrix[4,4] P = matrix_exp(Q * t);
+        for (k in 1:4)
+          ll[parent, k] = log_sum_exp(to_vector(log(P[k]) + ll[child]));
+      }
+
+      loglik_flipped = log_sum_exp(ll[root_node] + log(pi)');
+      x_log_lik[i] = log_softmax([loglik, loglik_flipped]')[1];
+    }
+
+    // Now repeat the same for y
+    for (i in 1:N) {
+      
+      for (n in 1:Nnodes)
+        ll[n] = rep_row_vector(negative_infinity(), 4);
+
+      for (j in 1:N) {
+        int zj = z[j];
+        if (j == i) {
+          // flip y but keep x
+          if (zj == 0) zj = 1;
+          else if (zj == 1) zj = 0;
+          else if (zj == 2) zj = 3;
+          else if (zj == 3) zj = 2;
+        }
+        ll[j, zj + 1] = 0;
+      }
+
+      for (e in 1:Nedges) {
+        int parent = edges[e, 1];
+        int child  = edges[e, 2];
+        real t = edge_lengths[e];
+        matrix[4,4] P = matrix_exp(Q * t);
+        for (k in 1:4)
+          ll[parent, k] = log_sum_exp(to_vector(log(P[k]) + ll[child]));
+      }
+
+      loglik_flipped = log_sum_exp(ll[root_node] + log(pi)');
+      y_log_lik[i] = log_softmax([loglik, loglik_flipped]')[1];
+    }
+  }
+
+  // Posterior predictive simulation
+  {
+    array[Nnodes] int latent_z;
+    latent_z[root_node] = categorical_rng(pi);
+
+    for (edge_idx in 1:Nedges) {
+      int edge_idx_b = Nedges + 1 - edge_idx;
+      int parent = edges[edge_idx_b, 1];
+      int child  = edges[edge_idx_b, 2];
+      real t = edge_lengths[edge_idx_b];
+      matrix[4, 4] P = matrix_exp(Q * t);
+
+      int zp = latent_z[parent];
+      if (zp >= 1 && zp <= 4) {
+        latent_z[child] = categorical_rng(to_vector(P[zp]));
+      } else {
+        latent_z[child] = categorical_rng(rep_vector(0.25, 4));
+      }
+    }
+
+    for (n in 1:N) {
+      int zval = latent_z[n] - 1;
+      x_rep[n] = zval / 2;
+      y_rep[n] = zval % 2;
+    }
+  }
+
+  // Prior predictive simulation
+  {
+    vector[8] rates_prior = dirichlet_rng(rep_vector(1.0, 8));
+    real total_rate_prior = gamma_rng(1.0, 1.0);
+
+    matrix[4, 4] Qp;
+    Qp[1,1] = -rates_prior[1] - rates_prior[2];
+    Qp[1,2] =  rates_prior[1];
+    Qp[1,3] =  rates_prior[2];
+    Qp[1,4] = 0;
+    Qp[2,1] = rates_prior[3];
+    Qp[2,2] = -rates_prior[3] - rates_prior[4];
+    Qp[2,3] = 0;
+    Qp[2,4] = rates_prior[4];
+    Qp[3,1] = rates_prior[5];
+    Qp[3,2] = 0;
+    Qp[3,3] = -rates_prior[5] - rates_prior[6];
+    Qp[3,4] = rates_prior[6];
+    Qp[4,1] = 0;
+    Qp[4,2] = rates_prior[7];
+    Qp[4,3] = rates_prior[8];
+    Qp[4,4] = -rates_prior[7] - rates_prior[8];
+    Qp = total_rate_prior * Qp;
+
+    vector[4] pi_prior = stationary_distribution(Qp);
+
+    array[Nnodes] int latent_z;
+    latent_z[root_node] = categorical_rng(pi_prior);
+
+    for (edge_idx in 1:Nedges) {
+      int edge_idx_b = Nedges + 1 - edge_idx;
+      int parent = edges[edge_idx_b, 1];
+      int child  = edges[edge_idx_b, 2];
+      real t = edge_lengths[edge_idx_b];
+      matrix[4, 4] P = matrix_exp(Qp * t);
+
+      int zp = latent_z[parent];
+      if (zp >= 1 && zp <= 4) {
+        latent_z[child] = categorical_rng(to_vector(P[zp]));
+      } else {
+        latent_z[child] = categorical_rng(rep_vector(0.25, 4));
+      }
+    }
+
+    for (n in 1:N) {
+      int zval = latent_z[n] - 1;
+      x_prior[n] = zval / 2;
+      y_prior[n] = zval % 2;
+    }
+  }
+}
+
+"
+
+stan_model_ctmc_dependent <- stan_model(model_code=stan_modelcode_ctmc_dependent)
+```
+
+```{r}
+#| vscode: {languageId: r}
+fit_ctmc_dependent <- sampling(
+    stan_model_ctmc_dependent,
+    data = stan_data,
+    iter = 2000,
+    chains = 4
+)
+```
+
+```{r}
+#| vscode: {languageId: r}
+print(fit_ctmc_dependent, pars=c("total_rate", "rates", "pi"))
+```
+
+### predictive checks
+
+```{r}
+#| vscode: {languageId: r}
+post_ctmc_dependent <- rstan::extract(fit_ctmc_dependent)
+predictive_check_marginal_binary(
+  x_prior = post_ctmc_dependent$x_prior,
+  x_rep = post_ctmc_dependent$x_rep,
+  x_obs = stan_data$x,
+  varname = "x"
+)
+```
+
+```{r}
+#| vscode: {languageId: r}
+predictive_checks_regression(post_ctmc_dependent$y_rep, post_ctmc_dependent$y_prior, stan_data)
+```
+
+Here we see the same issues that arose with the independent model: the prior is already quite informative, and the posterior does not differ much from the prior. This indicates that this model is not very flexible and does not fit the data well either.
+
+### model comparison
+
+```{r}
+#| vscode: {languageId: r}
+capture.output({
+    log_marginal_likelihood_ctmc_dependent <- bridge_sampler(fit_ctmc_dependent)
+}, file = "/dev/null")
+print(log_marginal_likelihood_ctmc_dependent)
+```
+
+And now the Bayes Factor:
+
+```{r}
+#| vscode: {languageId: r}
+(log_marginal_likelihood_ctmc_independent$logml - log_marginal_likelihood_ctmc_dependent$logml)
+```
+
+So we find moderate evidence in favor of the independent model.
+
+In this connection it is worth pointing out that the OU/logistic model provides a massively better fit than the CTMC model.
+
+```{r}
+#| vscode: {languageId: r}
+(log_marginal_likelihood_OU_correlation$logml - log_marginal_likelihood_ctmc_independent$logml)
+```
+
+This is reinforced by model comparison via Pareto-smoothed leave-one-out cross-validation.
+
+```{r}
+#| vscode: {languageId: r}
+# extract log-likelihood matrix: draws x observations
+log_lik6 <- extract_log_lik(fit_ctmc_independent, parameter_name = "y_log_lik")
+log_lik7 <- extract_log_lik(fit_ctmc_dependent, parameter_name = "y_log_lik")
+
+
+# compute LOO
+loo6 <- loo(log_lik6)
+loo7 <- loo(log_lik7)
+
+loo_list$ctmc_independent <- loo6
+loo_list$ctmc_dependent <- loo7
+
+# compare
+loo_compare(loo_list)
+```
+
+These results indicate that the Ornstein-Uhlenbeck models provide a massively better fit than all alternatives.
+
+The same pattern can be seen when we compare marginal loglikelihoods.
+
+```{r}
+#| vscode: {languageId: r}
+marginal_loglikelihoods <- tibble(
+    model = names(loo_list),
+    type = c(
+        'regression',
+        'correlation',
+        'regression',
+        'regression',
+        'correlation',
+        'correlation',
+        'correlation'
+    ),
+    marginal_loglikelhood = c(
+        log_marginal_likelihood_vanilla_regression$logml,
+        log_marginal_likelihood_vanilla_corr$logml,
+        log_marginal_likelihood_OU_regression$logml,
+        log_marginal_likelihood_brownian_regression$logml,
+        log_marginal_likelihood_OU_correlation$logml,
+        log_marginal_likelihood_ctmc_independent$logml,
+        log_marginal_likelihood_ctmc_dependent$logml
+    )
+)
+```
+
+```{r}
+#| vscode: {languageId: r}
+marginal_loglikelihoods %>%
+    filter(type == "regression") %>%
+    arrange(desc(marginal_loglikelhood))
+```
+
+```{r}
+#| vscode: {languageId: r}
+marginal_loglikelihoods %>%
+    filter(type == "correlation") %>%
+    arrange(desc(marginal_loglikelhood))
+```
+
+For the features and the tree used in this case study, the models using continuous latent variables are clearly superior to the CTMC models which assume evolution of discrete characters.
+
+Also, the Ornstein-Uhlenbeck process seems to provide a better fit to the data than a Brownian motion process.
+
+## Final thoughts
+
+All the models discussed here use a single phylogeny. It is possible to use a sample of phylogenies to factor in phylogenetic uncertainty in this framework, but it makes the models more complex and the fitting computationally more demanding.
+
+Essentially, what you have to do is:
+
+- Construct a 3-dimensional `edge` array (number of edges $\times$ 2 $\times$ number of trees), where each layer `edge[i,j,k]` indicates that there is a branch from node `i` to node `j` in tree number `k`. You have to make sure that all trees are in postorder.
+
+- Construct a number of edges $\times$ number of trees matrix `edge_lengths`
+
+- In the Stan model, you have to loop over all edges in all trees. So the phylogenetic recursion should look like
+
+```{stan}
+for (tr in 1:Ntrees) {
+    for (e in 1:Nedges) {
+        int parent = edges[e, 1, tr];
+        int child = edges[e, 2, tr];
+        real t = edge_lengths[e, tr];
+        ...
+    }
+}
+```
+
+- Inside the model block, add the line
+
+```{stan}
+target -= log(Ntrees);
+```
+
+Together, this averages over the likelihoods of all trees in the tree sample. Since the likelihoods of all trees in the sample have to be computed, this will slow down model fitting quite a bit.
+
+## References
+
+Bouckaert, R., Redding, D., Sheehan, O., Kyritsis, T., Gray, R., Jones, K. E., & Atkinson, Q. (2022). Global language diversification is linked to socio-ecology and threat status. SocArXiv. https://osf.io/f8tr6/download
+
+
+Pagel, M., & Meade, A. (2006). *Bayesian analysis of correlated evolution of discrete characters by reversible-jump Markov chain Monte Carlo*. The American Naturalist, 167(6), 808–825. https://doi.org/10.1086/503444
+

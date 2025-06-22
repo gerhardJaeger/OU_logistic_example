@@ -1,0 +1,12 @@
+[deps]
+BioSymbols = "3c28c6f8-a34d-59c4-9654-267d177fcfa9"
+CSV = "336ed68f-0bac-5ca0-87d4-7b16caf5d00b"
+CodecZlib = "944b1d66-785c-5afd-91f1-9de20f533193"
+DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
+Downloads = "f43a241f-c20a-4ad4-852c-f6b1247861c6"
+FileIO = "5789e2e9-d7fb-5bc7-8068-2c6fae9b9549"
+Glob = "c27321d9-0574-5035-807b-f59d2c89b15c"
+IJulia = "7073ff75-c697-5162-941a-fcdaad2a7d2a"
+Phylo = "aea672f4-3940-5932-aa44-993d1c3ff149"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+Turing = "fce5fe82-541a-59a6-adf8-730c64b5f9a0"
