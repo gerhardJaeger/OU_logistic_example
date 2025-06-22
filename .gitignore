@@ -1,2 +1,4 @@
 .ipynb_checkpoints/
 code/*.rds
+data/all_trees/
+code/Manifest.toml
