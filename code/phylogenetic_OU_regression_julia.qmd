@@ -18,6 +18,7 @@ cd(@__DIR__)
 using Pkg
 Pkg.activate(".")
 Pkg.instantiate()
+
 ```
 
 ## Loading the required packages
@@ -26,20 +27,21 @@ Pkg.instantiate()
 using CodecZlib: GzipDecompressor
 using CSV
 using DataFrames
+using DataFramesMeta
+using Distributions
 using Downloads
 using FileIO
 using Glob
+using MCMCChains
 using Phylo
+using Pipe
 using Printf
+using Statistics
+using StatsBase
+using StatsPlots
 using Tar
 using Turing
-using StatsPlots
-using MCMCChains
-using StatsBase
-using DataFramesMeta
-using Statistics
-using Pipe
-plotlyjs()
+
 ```
 
 ## Data
@@ -196,7 +198,7 @@ Let's run the model:
     model = vanilla_regression(d.x, d.y)
     chain = sample(
         model, 
-        NUTS(), 
+        NUTS(),
         MCMCThreads(),
         1000,
         4,
@@ -231,7 +233,8 @@ This looks reassuringly similar to the R/Stan model. Now let's plot the pior and
 ```{julia}
 
 function predictive_checks_regression(y_rep, y_prior; d=d)
-
+    obs_0 = mean(d.y[d.x .== 0])
+    obs_1 = mean(d.y[d.x .== 1])
     # Define colors
     CBblue = RGB(0.0, 114/255, 178/255)
     CBvermillion = RGB(213/255, 94/255, 0.0)
@@ -269,10 +272,13 @@ end
 #| vscode: {languageId: julia}
 gq = generated_quantities(chain, d.x, d.y)
 
-obs_0 = d.y[d.x .== 0] |> mean
-obs_1 = d.y[d.x .== 1] |> mean
+predictive_checks_regression(gq.y_rep, gq.y_prior)
+```
 
-y_prior = gq.y_prior
-y_rep = gq.y_rep
-predictive_checks_regression(y_rep, y_prior)
+Next we compute the marginal log-likelihood and the LOOIC.
+
+```{julia}
+#| vscode: {languageId: julia}
+# Compute the marginallog-likelihood
+
 ```

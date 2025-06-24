@@ -1,5 +1,4 @@
 [deps]
-BioSymbols = "3c28c6f8-a34d-59c4-9654-267d177fcfa9"
 CSV = "336ed68f-0bac-5ca0-87d4-7b16caf5d00b"
 CategoricalArrays = "324d7699-5711-5eae-9e2f-1d82baa6b597"
 CodecZlib = "944b1d66-785c-5afd-91f1-9de20f533193"
