@@ -38,7 +38,8 @@ using MCMCChains
 using StatsBase
 using DataFramesMeta
 using Statistics
-using CategoricalArrays
+using Pipe
+plotlyjs()
 ```
 
 ## Data
@@ -103,8 +104,10 @@ We use the same sample as in the previous notebook
 ```{julia}
 #| vscode: {languageId: julia}
 
-d = CSV.File("../data/grambank_vals_pruned.csv") |> DataFrame
-taxa = sort(unique(d.Language_ID))
+d = @pipe CSV.File("../data/grambank_vals_pruned.csv") |> 
+    DataFrame |>
+    sort(_, :Language_ID)
+taxa = d.Language_ID
 ```
 
 
@@ -195,7 +198,7 @@ Let's run the model:
         model, 
         NUTS(), 
         MCMCThreads(),
-        2_000,
+        1000,
         4,
         discard_initial = 1000,
         progress = true,
@@ -219,7 +222,7 @@ hpd(chain)
 #| vscode: {languageId: julia}
 # plot the posterior distributions of alpha and beta
 
-plot(chain, [:alpha, :beta]; legend=:topright, title="Posterior distributions of alpha and beta")
+ridgelineplot(chain, [:beta], title="Posterior distributions of beta")
 
 ```
 
@@ -227,61 +230,49 @@ This looks reassuringly similar to the R/Stan model. Now let's plot the pior and
 
 ```{julia}
 
+function predictive_checks_regression(y_rep, y_prior; d=d)
 
+    # Define colors
+    CBblue = RGB(0.0, 114/255, 178/255)
+    CBvermillion = RGB(213/255, 94/255, 0.0)
 
-function predictive_checks_regression(y_prior, y_rep, d)
-    x0_idx = findall(==(0), d.x)
-    x1_idx = findall(==(1), d.x)
-
-    # Prior predictive means per draw
-    p_y1_given_x0 = mean(y_prior[:, x0_idx], dims=2)[:]
-    p_y1_given_x1 = mean(y_prior[:, x1_idx], dims=2)[:]
-
-    # Posterior predictive means per draw
-    p_y1_rep_x0 = mean(y_rep[:, x0_idx], dims=2)[:]
-    p_y1_rep_x1 = mean(y_rep[:, x1_idx], dims=2)[:]
-
-    # Observed proportions
-    obs_p_y1_x0 = mean(d.y[d.x .== 0])
-    obs_p_y1_x1 = mean(d.y[d.x .== 1])
-
-    # Construct dataframes
-    df_sim = DataFrame(
-        x = repeat(["x=0", "x=1"], inner=length(p_y1_given_x0)),
-        p_y1 = vcat(p_y1_given_x0, p_y1_given_x1),
-        source = "prior"
+    p0 = density(vec(mean(y_prior[:, d.x .== 0]; dims=2)),
+        fill = (0, 0.5, CBblue),
+        label = "Prior",
+        title = "P(y=1|x=0)"
     )
+    density!(p0, vec(mean(y_rep[:, d.x .== 0]; dims=2)),
+        fill = (0, 0.5, CBvermillion),
+        label = "Posterior")
+    vline!(p0, [obs_0], color = :black, label = "", linewidth = 2)
 
-    df_post = DataFrame(
-        x = repeat(["x=0", "x=1"], inner=length(p_y1_rep_x0)),
-        p_y1 = vcat(p_y1_rep_x0, p_y1_rep_x1),
-        source = "posterior"
+
+    p1 = density(vec(mean(y_prior[:, d.x .== 1]; dims=2)),
+        fill = (0, 0.5, CBblue),
+        label=false,
+        title = "P(y=1|x=1)"
     )
-    # Combine and separate data
-    df_density = vcat(df_sim, df_post)
+    density!(p1, vec(mean(y_rep[:, d.x .== 1]; dims=2)),
+        fill = (0, 0.5, CBvermillion),
+        label = false
+    )
+    vline!(p1, [obs_1], color = :black, label = "", linewidth = 2)
 
-    df0 = filter(x -> x.x == "x=0", df_density)
-    df1 = filter(x -> x.x == "x=1", df_density)
 
-
-    p0 = @df df0 density(:x, :p_y1, group=:source, fill = (0, 0.5, :auto), color=:auto, legend=:topright)
-    vline!([obs_p_y1_x0], color=:black, label="Observed x=0", linewidth=2, linestyle=:dash, ax=p0)
-
-    p1 = @df df1 density(:x, :p_y1, group=:source, fill = (0, 0.5, :auto), color=:auto, legend=:topright)
-    vline!([obs_p_y1_x1], color=:black, label="Observed x=1", linewidth=2, linestyle=:dash, ax=p1)
-
-    plot(p0, p1, layout=(1,2), size=(900,300))
-
+    link = :both
+    plot(p0, p1, layout = (2, 1), link = :x, legend=:topleft)
 end
-
 
 ```
 
-
 ```{julia}
 #| vscode: {languageId: julia}
-# Get the generated quantities
 gq = generated_quantities(chain, d.x, d.y)
-# Plot the posterior predictive distribution
-predictive_checks_regression(gq.y_prior, gq.y_rep, d)
+
+obs_0 = d.y[d.x .== 0] |> mean
+obs_1 = d.y[d.x .== 1] |> mean
+
+y_prior = gq.y_prior
+y_rep = gq.y_rep
+predictive_checks_regression(y_rep, y_prior)
 ```
