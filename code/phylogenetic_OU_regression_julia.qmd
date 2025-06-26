@@ -4,9 +4,9 @@ format: html
 jupyter: julia-1.11
 ---
 
-# Including phylogenetic uncertainty - Julia verision
+# Including phylogenetic uncertainty - Julia version
 
-Often, we do not have a single phylogeny but a set of phylogenies, e.g., from a Bayesian phylogenetic inference. When using phylogenetic control, we want to marginalize over the phylogenetic uncertainty. Doing this in R + Stan is possible but cumbersome and computationallly expensive. Therefore I will explores re-implementations of the R/Stan models in Juilia + Turing.jl, and in Python + NumPyro.
+Often, we do not have a single phylogeny but a set of phylogenies, e.g., from a Bayesian phylogenetic inference. When using phylogenetic control, we want to marginalize over the phylogenetic uncertainty. Doing this in R + Stan is possible but cumbersome and computationally expensive. Therefore I will explore re-implementations of the R/Stan models in Julia + Turing.jl, and in Python + NumPyro.
 
 Let's start with Julia.
 
@@ -30,18 +30,20 @@ using DataFrames
 using DataFramesMeta
 using Distributions
 using Downloads
+using DynamicPPL
 using FileIO
 using Glob
+using LogDensityProblems
 using MCMCChains
 using Phylo
 using Pipe
 using Printf
+using RCall
 using Statistics
 using StatsBase
 using StatsPlots
 using Tar
 using Turing
-
 ```
 
 ## Data
@@ -106,9 +108,9 @@ We use the same sample as in the previous notebook
 ```{julia}
 #| vscode: {languageId: julia}
 
-d = @pipe CSV.File("../data/grambank_vals_pruned.csv") |> 
-    DataFrame |>
-    sort(_, :Language_ID)
+d = @pipe CSV.File("../data/grambank_vals_pruned.csv") |>
+          DataFrame |>
+          sort(_, :Language_ID)
 taxa = d.Language_ID
 ```
 
@@ -134,7 +136,7 @@ The likelihood is implemented as a Turing model like this:
 #| vscode: {languageId: julia}
 @model function vanilla_regression(x, y)
     N = length(y)
-    
+
     # Center x
     means_x = mean(x)
     Xc = x .- means_x
@@ -143,10 +145,17 @@ The likelihood is implemented as a Turing model like this:
     alpha ~ LocationScale(0, 2.5, TDist(3))
     beta ~ Normal(0, 2)
 
-    # Likelihood
+    # Likelihood - vectorized for efficiency
+    # Linear predictor
+    η = alpha .+ beta .* Xc
+
+    # Bernoulli logistic likelihood
     for i in 1:N
-        y[i] ~ BernoulliLogit(alpha + beta * Xc[i])
+        y[i] ~ BernoulliLogit(η[i])
     end
+
+    # Alternative vectorized approach (commented out for compatibility)
+    # y ~ arraydist([BernoulliLogit(η[i]) for i in 1:N])
 end
 ```
 
@@ -171,8 +180,8 @@ function generated_quantities(chain, x, y)
         β = chain[:beta][s]
 
         for n in 1:N
-            # log-likelihood
-            loglik[s, n] = logpdf(BernoulliLogit(α + β * x[n]), y[n])
+            # log-likelihood (using centered x for consistency)
+            loglik[s, n] = logpdf(BernoulliLogit(α + β * Xc[n]), y[n])
 
             # posterior predictive
             y_rep[s, n] = rand(BernoulliLogit(α + β * Xc[n]))
@@ -184,7 +193,7 @@ function generated_quantities(chain, x, y)
         end
     end
 
-    return (loglik = loglik, y_rep = y_rep, y_prior = y_prior)
+    return (loglik=loglik, y_rep=y_rep, y_prior=y_prior)
 end
 ```
 
@@ -197,14 +206,14 @@ Let's run the model:
 @time begin
     model = vanilla_regression(d.x, d.y)
     chain = sample(
-        model, 
+        model,
         NUTS(),
         MCMCThreads(),
         1000,
         4,
-        discard_initial = 1000,
-        progress = true,
-        )
+        discard_initial=1000,
+        progress=true,
+    )
 
 end
 # Print summary of the chain
@@ -228,42 +237,42 @@ ridgelineplot(chain, [:beta], title="Posterior distributions of beta")
 
 ```
 
-This looks reassuringly similar to the R/Stan model. Now let's plot the pior and posterior predictive distributions.
+This looks reassuringly similar to the R/Stan model. Now let's plot the prior and posterior predictive distributions.
 
 ```{julia}
 
 function predictive_checks_regression(y_rep, y_prior; d=d)
-    obs_0 = mean(d.y[d.x .== 0])
-    obs_1 = mean(d.y[d.x .== 1])
+    obs_0 = mean(d.y[d.x.==0])
+    obs_1 = mean(d.y[d.x.==1])
     # Define colors
-    CBblue = RGB(0.0, 114/255, 178/255)
-    CBvermillion = RGB(213/255, 94/255, 0.0)
+    CBblue = RGB(0.0, 114 / 255, 178 / 255)
+    CBvermillion = RGB(213 / 255, 94 / 255, 0.0)
 
-    p0 = density(vec(mean(y_prior[:, d.x .== 0]; dims=2)),
-        fill = (0, 0.5, CBblue),
-        label = "Prior",
-        title = "P(y=1|x=0)"
+    p0 = density(vec(mean(y_prior[:, d.x.==0]; dims=2)),
+        fill=(0, 0.5, CBblue),
+        label="Prior",
+        title="P(y=1|x=0)"
     )
-    density!(p0, vec(mean(y_rep[:, d.x .== 0]; dims=2)),
-        fill = (0, 0.5, CBvermillion),
-        label = "Posterior")
-    vline!(p0, [obs_0], color = :black, label = "", linewidth = 2)
+    density!(p0, vec(mean(y_rep[:, d.x.==0]; dims=2)),
+        fill=(0, 0.5, CBvermillion),
+        label="Posterior")
+    vline!(p0, [obs_0], color=:black, label="", linewidth=2)
 
 
-    p1 = density(vec(mean(y_prior[:, d.x .== 1]; dims=2)),
-        fill = (0, 0.5, CBblue),
+    p1 = density(vec(mean(y_prior[:, d.x.==1]; dims=2)),
+        fill=(0, 0.5, CBblue),
         label=false,
-        title = "P(y=1|x=1)"
+        title="P(y=1|x=1)"
     )
-    density!(p1, vec(mean(y_rep[:, d.x .== 1]; dims=2)),
-        fill = (0, 0.5, CBvermillion),
-        label = false
+    density!(p1, vec(mean(y_rep[:, d.x.==1]; dims=2)),
+        fill=(0, 0.5, CBvermillion),
+        label=false
     )
-    vline!(p1, [obs_1], color = :black, label = "", linewidth = 2)
+    vline!(p1, [obs_1], color=:black, label="", linewidth=2)
 
 
     link = :both
-    plot(p0, p1, layout = (2, 1), link = :x, legend=:topleft)
+    plot(p0, p1, layout=(2, 1), link=:x, legend=:topleft)
 end
 
 ```
@@ -279,6 +288,24 @@ Next we compute the marginal log-likelihood and the LOOIC.
 
 ```{julia}
 #| vscode: {languageId: julia}
-# Compute the marginallog-likelihood
+
+
+function create_logdensity_function(model)
+    # Create a LogDensityProblems-compatible object
+    logdensity_obj = DynamicPPL.LogDensityFunction(model)
+
+    return function (params::Vector{Float64})
+        # Use LogDensityProblems.logdensity instead of DynamicPPL.logdensity
+        return LogDensityProblems.logdensity(logdensity_obj, params)
+    end
+end
+
+```
+
+```{julia}
+#| vscode: {languageId: julia}
+# Compute log-likelihood
+logdensity_func = create_logdensity_function(model)
+logposterior = logdensity_func([0.2, 0.3])
 
 ```
