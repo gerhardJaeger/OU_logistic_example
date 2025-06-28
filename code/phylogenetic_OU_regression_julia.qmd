@@ -33,14 +33,17 @@ using Downloads
 using DynamicPPL
 using FileIO
 using Glob
+using LinearAlgebra
 using LogDensityProblems
 using MCMCChains
+using Optim
 using Phylo
 using Pipe
 using Printf
 using RCall
 using Statistics
 using StatsBase
+using StatsFuns
 using StatsPlots
 using Tar
 using Main.Threads
@@ -312,14 +315,17 @@ logdensity_func = create_logdensity_function(model)
 ```
 
 ```{julia}
+
+samples = [Vector(chain[:alpha][:]) Vector(chain[:beta][:])]
+
+```
+
+```{julia}
 #| vscode: {languageId: julia}
-
-
 
 function bridge_sampling(
       samples::Array{Float64,2},
-      log_density::Function;
-      verbose = false,
+      log_density::Function
 )
       nr = size(samples, 1) ÷ 2
       samples_4_fit = permutedims(Array(samples[1:nr, :]))
@@ -378,4 +384,11 @@ function bridge_sampling(
       ft.minimizer + lstar
 
 end
+```
+
+```{julia}
+#| vscode: {languageId: julia}
+# Compute marginal log-likelihood
+logml = bridge_sampling(samples, logdensity_func)
+println("Marginal log-likelihood: ", logml)
 ```
