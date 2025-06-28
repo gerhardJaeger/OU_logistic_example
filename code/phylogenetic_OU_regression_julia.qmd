@@ -392,3 +392,44 @@ end
 logml = bridge_sampling(samples, logdensity_func)
 println("Marginal log-likelihood: ", logml)
 ```
+
+
+```{julia}
+#| vscode: {languageId: julia}
+# Compute LOOIC
+loo_vanilla_regression = convert(
+      Dict,
+      R"
+      library(loo)
+      loo($(gq.loglik))
+      ",
+);
+```
+
+```{julia}
+#| vscode: {languageId: julia}
+
+# Alternative: Create a more structured view of LOO results
+function format_loo_results(loo_dict)
+    # Extract the main metrics
+    estimates = DataFrame(
+        metric = ["LOOIC", "SE of LOOIC", "elpd_loo", "SE of elpd_loo"],
+        value = [
+            loo_dict["looic"],
+            loo_dict["se_looic"],
+            loo_dict["elpd_loo"],
+            loo_dict["se_p_loo"]
+        ]
+    )
+    return estimates
+end
+
+```
+
+```{julia}
+# Print LOO results
+println("LOO Results:")
+loo_results = format_loo_results(loo_vanilla_regression)
+println(loo_results)
+```
+
