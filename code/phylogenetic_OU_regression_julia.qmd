@@ -40,6 +40,7 @@ using Optim
 using Phylo
 using Pipe
 using Printf
+using ProgressMeter
 using RCall
 using Statistics
 using StatsBase
@@ -208,9 +209,9 @@ Let's run the model:
 
 # Run the model
 @time begin
-    model = vanilla_regression(d.x, d.y)
-    chain = sample(
-        model,
+    model_vanilla_regression = vanilla_regression(d.x, d.y)
+    chain_vanilla_regression = sample(
+        model_vanilla_regression,
         NUTS(),
         MCMCThreads(),
         1000,
@@ -221,7 +222,7 @@ Let's run the model:
 
 end
 # Print summary of the chain
-describe(chain)
+describe(chain_vanilla_regression)
 ```
 
 The 95% credible intervals for the parameters are:
@@ -229,7 +230,7 @@ The 95% credible intervals for the parameters are:
 ```{julia}
 #| vscode: {languageId: julia}
 
-hpd(chain)
+hpd(chain_vanilla_regression)
 ```
 
 
@@ -237,7 +238,7 @@ hpd(chain)
 #| vscode: {languageId: julia}
 # plot the posterior distributions of alpha and beta
 
-ridgelineplot(chain, [:beta], title="Posterior distributions of beta")
+ridgelineplot(chain_vanilla_regression, [:beta], title="Posterior distributions of beta")
 
 ```
 
@@ -283,9 +284,9 @@ end
 
 ```{julia}
 #| vscode: {languageId: julia}
-gq = generated_quantities(chain, d.x, d.y)
+gq_vanilla_regression = generated_quantities(chain_vanilla_regression, d.x, d.y)
 
-predictive_checks_regression(gq.y_rep, gq.y_prior)
+predictive_checks_regression(gq_vanilla_regression.y_rep, gq_vanilla_regression.y_prior)
 ```
 
 Next we compute the marginal log-likelihood and the LOOIC.
@@ -309,14 +310,14 @@ end
 ```{julia}
 #| vscode: {languageId: julia}
 # Compute log-likelihood
-logdensity_func = create_logdensity_function(model)
+logdensity_func_vanilla_regression = create_logdensity_function(model_vanilla_regression)
 
 
 ```
 
 ```{julia}
 
-samples = [Vector(chain[:alpha][:]) Vector(chain[:beta][:])]
+samples_vanilla_regression = [Vector(chain_vanilla_regression[:alpha][:]) Vector(chain_vanilla_regression[:beta][:])]
 
 ```
 
@@ -324,64 +325,64 @@ samples = [Vector(chain[:alpha][:]) Vector(chain[:beta][:])]
 #| vscode: {languageId: julia}
 
 function bridge_sampling(
-      samples::Array{Float64,2},
-      log_density::Function
+    samples::Array{Float64,2},
+    log_density::Function
 )
-      nr = size(samples, 1) ÷ 2
-      samples_4_fit = permutedims(Array(samples[1:nr, :]))
-      samples_4_iter = permutedims(Array(samples[(nr+1):end, :]))
-      r0 = 0.5
-      tol1 = 1e-10
-      n_post = size(samples_4_iter, 2)
-      m = vec(mapslices(mean, samples_4_fit, dims = 2))::Vector{Float64}
-      V = diagm(ones(size(samples, 2)))
-      q11 = Vector{Float64}(undef, n_post) # unnormalized posterior
-      @threads for i = 1:n_post
-            q11[i] = log_density(Array(samples_4_iter[:, i]))
-      end
-      q12 = Vector{Float64}(undef, n_post) # g
-      @threads for i = 1:n_post
-            q12[i] = logpdf(MvNormal(m, V), samples_4_iter[:, i])
-      end
-      gen_samples = rand(MvNormal(m, V), n_post)
-      q21 = Vector{Float64}(undef, n_post) # unnormalized posterior
-      @threads for i = 1:n_post
-            q21[i] = log_density(gen_samples[:, i])
-      end
-      q22 = Vector{Float64}(undef, n_post) # g
-      @threads for i = 1:n_post
-            q22[i] = logpdf(MvNormal(m, V), gen_samples[:, i])
-      end
-      l1 = q11 - q12 # samples_4_iter, unnormalized posterior / g
-      l2 = q21 - q22# gen_samples, unnormalized posterior / g
-      lstar = median(l1)
-      n_1 = length(l1)
-      n_2 = length(l2)
-      neff = (1.0 * n_1)::Float64
-      try
-            neff = minimum(summarystats(sim).value[:, end, 1])
-      catch e
-      end
-      s1 = neff ./ (neff .+ n_2)
-      s2 = n_2 ./ (neff .+ n_2)
-      logr = log(r0)
-      log_r_vals = [logr]::Vector{Float64}
-      logml = logr + lstar
+    nr = size(samples, 1) ÷ 2
+    samples_4_fit = permutedims(Array(samples[1:nr, :]))
+    samples_4_iter = permutedims(Array(samples[(nr+1):end, :]))
+    r0 = 0.5
+    tol1 = 1e-10
+    n_post = size(samples_4_iter, 2)
+    m = vec(mapslices(mean, samples_4_fit, dims=2))::Vector{Float64}
+    V = diagm(ones(size(samples, 2)))
+    q11 = Vector{Float64}(undef, n_post) # unnormalized posterior
+    @threads for i = 1:n_post
+        q11[i] = log_density(Array(samples_4_iter[:, i]))
+    end
+    q12 = Vector{Float64}(undef, n_post) # g
+    @threads for i = 1:n_post
+        q12[i] = logpdf(MvNormal(m, V), samples_4_iter[:, i])
+    end
+    gen_samples = rand(MvNormal(m, V), n_post)
+    q21 = Vector{Float64}(undef, n_post) # unnormalized posterior
+    @threads for i = 1:n_post
+        q21[i] = log_density(gen_samples[:, i])
+    end
+    q22 = Vector{Float64}(undef, n_post) # g
+    @threads for i = 1:n_post
+        q22[i] = logpdf(MvNormal(m, V), gen_samples[:, i])
+    end
+    l1 = q11 - q12 # samples_4_iter, unnormalized posterior / g
+    l2 = q21 - q22# gen_samples, unnormalized posterior / g
+    lstar = median(l1)
+    n_1 = length(l1)
+    n_2 = length(l2)
+    neff = (1.0 * n_1)::Float64
+    try
+        neff = minimum(summarystats(sim).value[:, end, 1])
+    catch e
+    end
+    s1 = neff ./ (neff .+ n_2)
+    s2 = n_2 ./ (neff .+ n_2)
+    logr = log(r0)
+    log_r_vals = [logr]::Vector{Float64}
+    logml = logr + lstar
 
-      function upd(logr)
-            lognumi = logsumexp([
-                  l2[i] - lstar - logaddexp(log(s1) + l2[i] - lstar, log(s2) + logr) for
-                  i = 1:size(l2, 1)
-            ])
-            logdeni = logsumexp([
-                  -logaddexp(log(s1) + l1[i] - lstar, log(s2) .+ logr) for
-                  i = 1:size(l1, 1)
-            ])
-            log(n_1) - log(n_2) + lognumi - logdeni
-      end
+    function upd(logr)
+        lognumi = logsumexp([
+            l2[i] - lstar - logaddexp(log(s1) + l2[i] - lstar, log(s2) + logr) for
+            i = 1:size(l2, 1)
+        ])
+        logdeni = logsumexp([
+            -logaddexp(log(s1) + l1[i] - lstar, log(s2) .+ logr) for
+            i = 1:size(l1, 1)
+        ])
+        log(n_1) - log(n_2) + lognumi - logdeni
+    end
 
-      ft = optimize(y -> (upd(y)-y)^2, -10000., 0.)
-      ft.minimizer + lstar
+    ft = optimize(y -> (upd(y) - y)^2, -10000., 0.)
+    ft.minimizer + lstar
 
 end
 ```
@@ -389,8 +390,8 @@ end
 ```{julia}
 #| vscode: {languageId: julia}
 # Compute marginal log-likelihood
-logml = bridge_sampling(samples, logdensity_func)
-println("Marginal log-likelihood: ", logml)
+logml_vanilla_regression = bridge_sampling(samples_vanilla_regression, logdensity_func_vanilla_regression)
+println("Marginal log-likelihood: ", logml_vanilla_regression)
 ```
 
 
@@ -398,11 +399,11 @@ println("Marginal log-likelihood: ", logml)
 #| vscode: {languageId: julia}
 # Compute LOOIC
 loo_vanilla_regression = convert(
-      Dict,
-      R"
-      library(loo)
-      loo($(gq.loglik))
-      ",
+    Dict,
+    R"
+    library(loo)
+    loo($(gq_vanilla_regression.loglik))
+    ",
 );
 ```
 
@@ -413,8 +414,8 @@ loo_vanilla_regression = convert(
 function format_loo_results(loo_dict)
     # Extract the main metrics
     estimates = DataFrame(
-        metric = ["LOOIC", "SE of LOOIC", "elpd_loo", "SE of elpd_loo"],
-        value = [
+        metric=["LOOIC", "SE of LOOIC", "elpd_loo", "SE of elpd_loo"],
+        value=[
             loo_dict["looic"],
             loo_dict["se_looic"],
             loo_dict["elpd_loo"],
@@ -429,7 +430,127 @@ end
 ```{julia}
 # Print LOO results
 println("LOO Results:")
-loo_results = format_loo_results(loo_vanilla_regression)
-println(loo_results)
+loo_results_vanilla_regression = format_loo_results(loo_vanilla_regression)
+println(loo_results_vanilla_regression)
 ```
 
+```{julia}
+#| vscode: {languageId: julia}
+
+@model function vanilla_correlation(x, y)
+    N = length(y)
+
+    # Priors
+    mu ~ MvNormal(2, 2.0)
+    L_R ~ LKJCholesky(2, 1.0)
+
+    # Latent variables: raw standard normal vectors
+    # Sample standard normal
+    z_std = Matrix{Float64}(undef, 2, N)
+    for n in 1:N
+        z_std[:, n] ~ MvNormal(I(2))
+    end
+
+    # Transform outside the sampling statement
+    z = L_R.L * z_std .+ mu
+
+    # Likelihood
+    for n in 1:N
+        x[n] ~ BernoulliLogit(z[1, n])
+        y[n] ~ BernoulliLogit(z[2, n])
+    end
+
+    # Compute correlation from the correlation matrix
+    R = L_R.L * L_R.L'
+    ρ := R[1, 2]
+    μ1 := mu[1]
+    μ2 := mu[2]
+end
+
+
+```
+
+```{julia}
+#| vscode: {languageId: julia}
+
+@time begin
+    model_vanilla_correlation = vanilla_correlation(d.x, d.y)
+    chain_vanilla_correlation = sample(
+        model_vanilla_correlation,
+        NUTS(),
+        MCMCThreads(),
+        1000,
+        4,
+        discard_initial=1000,
+        progress=true,
+    )
+
+end
+# Print summary of the chain
+describe(
+    chain_vanilla_correlation[:, [:μ1, :μ2, :ρ], :]
+)
+
+```
+
+```{julia}
+#| vscode: {languageId: julia}
+
+hpd(chain_vanilla_correlation[:, [:μ1, :μ2, :ρ], :])
+```
+
+```{julia}
+#| vscode: {languageId: julia}
+# plot the posterior distributions of alpha and beta
+
+ridgelineplot(chain_vanilla_correlation, [:ρ], title="Posterior distributions of ρ")
+
+```
+
+# Prior and posterior predictive sampling for vanilla_correlation
+
+```{julia}
+function generated_quantities_correlation(chain, x, y)
+    N = length(y)
+    nsamples = length(chain[:μ1])
+    loglik = zeros(nsamples, N)
+    y_rep = zeros(Int, nsamples, N)
+    x_rep = zeros(Int, nsamples, N)
+    y_prior = zeros(Int, nsamples, N)
+    x_prior = zeros(Int, nsamples, N)
+
+    for s in 1:nsamples
+        μ = [chain[:μ1][s], chain[:μ2][s]]
+        # Reconstruct Cholesky factor from chain
+        ρ = chain[:ρ][s]
+        L = [
+            1.0 0.0
+            ρ sqrt(1 - ρ^2)
+        ]
+        # Posterior predictive
+        for n in 1:N
+            z = L * randn(2) .+ μ
+            x_rep[s, n] = rand(BernoulliLogit(z[1]))
+            y_rep[s, n] = rand(BernoulliLogit(z[2]))
+            loglik[s, n] = logpdf(BernoulliLogit(z[2]), y[n])
+        end
+        # Prior predictive
+        μp = rand(MvNormal(2, 2.0))
+        Lp = cholesky(rand(LKJ(2, 2.0))).L
+        for n in 1:N
+            zp = Lp * randn(2) .+ μp
+            x_prior[s, n] = rand(BernoulliLogit(zp[1]))
+            y_prior[s, n] = rand(BernoulliLogit(zp[2]))
+        end
+    end
+
+    return (loglik=loglik, x_rep=x_rep, y_rep=y_rep, x_prior=x_prior, y_prior=y_prior)
+end
+
+# Run generated quantities for the correlation model
+gq_vanilla_correlation = generated_quantities_correlation(chain_vanilla_correlation, d.x, d.y)
+
+# Plot predictive checks for y
+predictive_checks_regression(gq_vanilla_correlation.y_rep, gq_vanilla_correlation.y_prior; d=d)
+
+```
