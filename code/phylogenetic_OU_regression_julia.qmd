@@ -41,6 +41,7 @@ using Phylo
 using Pipe
 using Printf
 using ProgressMeter
+using Random
 using RCall
 using Statistics
 using StatsBase
@@ -140,8 +141,7 @@ The likelihood is implemented as a Turing model like this:
 ```{julia}
 #| vscode: {languageId: julia}
 @model function vanilla_regression(x, y)
-    N = length(y)
-
+    N = length(x)
     # Center x
     means_x = mean(x)
     Xc = x .- means_x
@@ -150,65 +150,31 @@ The likelihood is implemented as a Turing model like this:
     alpha ~ LocationScale(0, 2.5, TDist(3))
     beta ~ Normal(0, 2)
 
-    # Likelihood - vectorized for efficiency
     # Linear predictor
     η = alpha .+ beta .* Xc
-
-    # Bernoulli logistic likelihood
+    
+    # Likelihood
     for i in 1:N
         y[i] ~ BernoulliLogit(η[i])
     end
+    
+    loglik := [logpdf(BernoulliLogit(η[i]), y[i]) for i in 1:N]
+    y_rep := [rand(BernoulliLogit(η[i])) for i in 1:N]
 end
 ```
 
-The `generated quantities` block from the Stan model is implemented as a separate function:
 
-```{julia}
-#| vscode: {languageId: julia}
-#| 
-# Log-likelihood, posterior predictive, and prior predictive in a function:
-function generated_quantities(chain, x, y)
-    N = length(y)
-    means_x = mean(x)
-    Xc = x .- means_x
 
-    nsamples = length(chain[:alpha])
-    loglik = zeros(nsamples, N)
-    y_rep = zeros(Int, nsamples, N)
-    y_prior = zeros(Int, nsamples, N)
-
-    for s in 1:nsamples
-        α = chain[:alpha][s]
-        β = chain[:beta][s]
-
-        for n in 1:N
-            # log-likelihood (using centered x for consistency)
-            loglik[s, n] = logpdf(BernoulliLogit(α + β * Xc[n]), y[n])
-
-            # posterior predictive
-            y_rep[s, n] = rand(BernoulliLogit(α + β * Xc[n]))
-
-            # prior predictive
-            αp = rand(LocationScale(0, 2.5, TDist(3)))
-            βp = rand(Normal(0, 2))
-            y_prior[s, n] = rand(BernoulliLogit(αp + βp * Xc[n]))
-        end
-    end
-
-    return (loglik=loglik, y_rep=y_rep, y_prior=y_prior)
-end
-```
 
 Let's run the model:
 
 ```{julia}
 #| vscode: {languageId: julia}
 
-# Run the model
+# Run the model with actual data
 @time begin
-    model_vanilla_regression = vanilla_regression(d.x, d.y)
     chain_vanilla_regression = sample(
-        model_vanilla_regression,
+        vanilla_regression(d.x, d.y),
         NUTS(),
         MCMCThreads(),
         1000,
@@ -219,7 +185,7 @@ Let's run the model:
 
 end
 # Print summary of the chain
-describe(chain_vanilla_regression)
+describe(chain_vanilla_regression[:, [:alpha, :beta], :])
 ```
 
 The 95% credible intervals for the parameters are:
@@ -227,7 +193,7 @@ The 95% credible intervals for the parameters are:
 ```{julia}
 #| vscode: {languageId: julia}
 
-hpd(chain_vanilla_regression)
+hpd(chain_vanilla_regression[:, [:alpha, :beta], :])
 ```
 
 
@@ -250,23 +216,23 @@ function predictive_checks_regression(y_rep, y_prior; d=d)
     CBblue = RGB(0.0, 114 / 255, 178 / 255)
     CBvermillion = RGB(213 / 255, 94 / 255, 0.0)
 
-    p0 = density(vec(mean(y_prior[:, d.x.==0]; dims=2)),
+    p0 = density(y_prior[d.x.==0],
         fill=(0, 0.5, CBblue),
         label="Prior",
         title="P(y=1|x=0)"
     )
-    density!(p0, vec(mean(y_rep[:, d.x.==0]; dims=2)),
+    density!(p0, y_rep[d.x.==0],
         fill=(0, 0.5, CBvermillion),
         label="Posterior")
     vline!(p0, [obs_0], color=:black, label="", linewidth=2)
 
 
-    p1 = density(vec(mean(y_prior[:, d.x.==1]; dims=2)),
+    p1 = density(y_prior[d.x.==1],
         fill=(0, 0.5, CBblue),
         label=false,
         title="P(y=1|x=1)"
     )
-    density!(p1, vec(mean(y_rep[:, d.x.==1]; dims=2)),
+    density!(p1, y_rep[d.x.==1],
         fill=(0, 0.5, CBvermillion),
         label=false
     )
@@ -279,11 +245,24 @@ end
 
 ```
 
-```{julia}
-#| vscode: {languageId: julia}
-gq_vanilla_regression = generated_quantities(chain_vanilla_regression, d.x, d.y)
+Next we sample from the prior and the posterior. In Turing, this is fairly straightforward.
 
-predictive_checks_regression(gq_vanilla_regression.y_rep, gq_vanilla_regression.y_prior)
+```{julia}
+# Prior predictive sampling - sample from prior with missing y
+model_prior = vanilla_regression(d.x, fill(missing, length(d.x)))
+prior_chain = sample(model_prior, Prior(), 4000)
+
+# Posterior predictive sampling - use the fitted chain
+
+y_rep_names = [v for v in names(prior_chain) if occursin("y_rep", string(v))]
+
+y_prior = mean(Array(prior_chain[:, y_rep_names, :]), dims=1) |> vec
+
+y_rep = mean(Array(chain_vanilla_regression[:, y_rep_names, :]), dims=1) |> vec
+```
+
+```{julia}
+predictive_checks_regression(y_rep, y_prior)
 ```
 
 Next we compute the marginal log-likelihood and the LOOIC.
@@ -307,7 +286,7 @@ end
 ```{julia}
 #| vscode: {languageId: julia}
 # Compute log-likelihood
-logdensity_func_vanilla_regression = create_logdensity_function(model_vanilla_regression)
+logdensity_func_vanilla_regression = create_logdensity_function(vanilla_regression(d.x, d.y))
 
 
 ```
@@ -393,13 +372,18 @@ println("Marginal log-likelihood: ", logml_vanilla_regression)
 
 
 ```{julia}
+
+loglik_names = [v for v in names(chain_vanilla_regression) if occursin("loglik", string(v))]
+
+loglik_vanilla = Array(chain_vanilla_regression[:, loglik_names, :])
+
 #| vscode: {languageId: julia}
 # Compute LOOIC
 loo_vanilla_regression = convert(
     Dict,
     R"
     library(loo)
-    loo($(gq_vanilla_regression.loglik))
+    loo($(loglik_vanilla))
     ",
 );
 ```
@@ -434,26 +418,35 @@ println(loo_results_vanilla_regression)
 ```{julia}
 #| vscode: {languageId: julia}
 
+
 @model function vanilla_correlation(x, y)
     N = length(y)
 
     # Priors
-    μ1 ~ Normal(0, 2.0)
-    μ2 ~ Normal(0, 2.0)
-    ρ ~ Uniform(-1, 1)
+    mu ~ MvNormal(2, 2.0)
+    L_R ~ LKJCholesky(2, 1.0)
 
-    # Construct covariance matrix from correlation
-    Σ = [1.0 ρ; ρ 1.0]
-    μ = [μ1, μ2]
-    
-    # Sample latent variables directly from multivariate normal
+    # Latent variables: raw standard normal vectors
+    # Sample standard normal
+    z_std = Matrix{Float64}(undef, 2, N)
     for n in 1:N
-        z[n] ~ MvNormal(μ, Σ)
-        
-        # Likelihood
-        x[n] ~ BernoulliLogit(z[n][1])
-        y[n] ~ BernoulliLogit(z[n][2])
+        z_std[:, n] ~ MvNormal(I(2))
     end
+
+    # Transform outside the sampling statement
+    z = L_R.L * z_std .+ mu
+
+    # Likelihood
+    for n in 1:N
+        x[n] ~ BernoulliLogit(z[1, n])
+        y[n] ~ BernoulliLogit(z[2, n])
+    end
+
+    # Compute correlation from the correlation matrix
+    R = L_R.L * L_R.L'
+    rho  := R[1, 2]
+    mu1 := mu[1]
+    mu2 := mu[2]
 end
 
 
@@ -463,21 +456,20 @@ end
 #| vscode: {languageId: julia}
 
 @time begin
-    model_vanilla_correlation = vanilla_correlation(d.x, d.y)
     chain_vanilla_correlation = sample(
-        model_vanilla_correlation,
+        vanilla_correlation(d.x, d.y),
         NUTS(),
         MCMCThreads(),
-        1000,
+        200,
         4,
-        discard_initial=1000,
+        discard_initial=200,
         progress=true,
     )
 
 end
 # Print summary of the chain
 describe(
-    chain_vanilla_correlation[:, [:μ1, :μ2, :ρ], :]
+    chain_vanilla_correlation[:, [:mu1, :mu2, :rho], :]
 )
 
 ```
@@ -485,82 +477,32 @@ describe(
 ```{julia}
 #| vscode: {languageId: julia}
 
-hpd(chain_vanilla_correlation[:, [:μ1, :μ2, :ρ], :])
+hpd(chain_vanilla_correlation[:, [:mu1, :mu2, :rho], :])
 ```
 
 ```{julia}
 #| vscode: {languageId: julia}
 # plot the posterior distributions of alpha and beta
 
-ridgelineplot(chain_vanilla_correlation, [:ρ], title="Posterior distributions of ρ")
+ridgelineplot(chain_vanilla_correlation, [:rho], title="Posterior distributions of ρ")
 
 ```
 
 # Prior and posterior predictive sampling for vanilla_correlation
 
-```{julia}
-function generated_quantities_correlation(chain, x, y)
-    N = length(y)
-    nsamples = length(chain[:μ1])
-    loglik = zeros(nsamples, N)
-    y_rep = zeros(Int, nsamples, N)
-    x_rep = zeros(Int, nsamples, N)
-    y_prior = zeros(Int, nsamples, N)
-    x_prior = zeros(Int, nsamples, N)
-
-    for s in 1:nsamples
-        μ1 = chain[:μ1][s]
-        μ2 = chain[:μ2][s]
-        ρ = chain[:ρ][s]
-        
-        # Construct covariance matrix
-        μ = [μ1, μ2]
-        Σ = [1.0 ρ; ρ 1.0]
-        
-        # Posterior predictive
-        for n in 1:N
-            z = rand(MvNormal(μ, Σ))
-            x_rep[s, n] = rand(BernoulliLogit(z[1]))
-            y_rep[s, n] = rand(BernoulliLogit(z[2]))
-            loglik[s, n] = logpdf(BernoulliLogit(z[2]), y[n])
-        end
-        
-        # Prior predictive
-        μ1p = rand(Normal(0, 2.0))
-        μ2p = rand(Normal(0, 2.0))
-        ρp = rand(Uniform(-1, 1))
-        μp = [μ1p, μ2p]
-        Σp = [1.0 ρp; ρp 1.0]
-        
-        for n in 1:N
-            zp = rand(MvNormal(μp, Σp))
-            x_prior[s, n] = rand(BernoulliLogit(zp[1]))
-            y_prior[s, n] = rand(BernoulliLogit(zp[2]))
-        end
-    end
-
-    return (loglik=loglik, x_rep=x_rep, y_rep=y_rep, x_prior=x_prior, y_prior=y_prior)
-end
-
-# Run generated quantities for the correlation model
-gq_vanilla_correlation = generated_quantities_correlation(chain_vanilla_correlation, d.x, d.y)
-
-# Plot predictive checks for y
-predictive_checks_regression(gq_vanilla_correlation.y_rep, gq_vanilla_correlation.y_prior; d=d)
-
-```
-
 Computing the marginal log-likelihood and LOOIC for the correlation model:
 
 ```{julia}
 # Compute log-likelihood
-logdensity_func_vanilla_correlation = create_logdensity_function(model_vanilla_correlation)
+logdensity_func = create_logdensity_function(vanilla_correlation(d.x, d.y))
 
+N = length(d.x)
+samples = Array(chain_vanilla_correlation)
 
-samples_vanilla_correlation = [Vector(chain_vanilla_correlation[:ρ][:]) Vector(chain_vanilla_correlation[:μ1][:]) Vector(chain_vanilla_correlation[:μ2][:])]
+logml = bridge_sampling(Array(chain_vanilla_correlation), logdensity_func)
 
-logml_vanilla_correlation = bridge_sampling(samples_vanilla_correlation, logdensity_func_vanilla_correlation)
 
 println("Marginal log-likelihood: ", logml_vanilla_correlation)
+
 
 ```
