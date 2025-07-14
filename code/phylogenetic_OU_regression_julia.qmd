@@ -48,6 +48,7 @@ using StatsBase
 using StatsFuns
 using StatsPlots
 using Tar
+using TransformVariables
 using Main.Threads
 using Turing
 ```
@@ -270,7 +271,6 @@ Next we compute the marginal log-likelihood and the LOOIC.
 ```{julia}
 #| vscode: {languageId: julia}
 
-
 function create_logdensity_function(model)
     # Create a LogDensityProblems-compatible object
     logdensity_obj = DynamicPPL.LogDensityFunction(model)
@@ -456,8 +456,9 @@ end
 #| vscode: {languageId: julia}
 
 @time begin
+    model_vanilla_correlation = vanilla_correlation(d.x, d.y)
     chain_vanilla_correlation = sample(
-        vanilla_correlation(d.x, d.y),
+        model_vanilla_correlation,
         NUTS(),
         MCMCThreads(),
         200,
@@ -492,15 +493,22 @@ ridgelineplot(chain_vanilla_correlation, [:rho], title="Posterior distributions 
 
 Computing the marginal log-likelihood and LOOIC for the correlation model:
 
+
 ```{julia}
 # Compute log-likelihood
-logdensity_func = create_logdensity_function(vanilla_correlation(d.x, d.y))
 
-N = length(d.x)
-samples = Array(chain_vanilla_correlation)
+logdensity_obj = DynamicPPL.LogDensityFunction(model_vanilla_correlation)
 
-logml = bridge_sampling(Array(chain_vanilla_correlation), logdensity_func)
+DynamicPPL.link!!(logdensity_obj.varinfo, model_vanilla_correlation)
 
+sample_vanilla_correlation = Array(chain_vanilla_correlation)
+LogDensityProblems.logdensity(logdensity_obj, sample_vanilla_correlation[1,:])
+
+function logdensity_function_vanilla_correlation(params::Vector{Float64})
+    LogDensityProblems.logdensity(logdensity_obj, params)
+end
+
+logml_vanilla_correlation = bridge_sampling(sample_vanilla_correlation, logdensity_function_vanilla_correlation)
 
 println("Marginal log-likelihood: ", logml_vanilla_correlation)
 
