@@ -131,8 +131,45 @@ for t in pruned_trees
     droptips!(t, setdiff(getleafnames(t), taxa))
 end
 ```
+################################
+# Spielwiese
+
+```{julia}
+
+@model function mybernoulli(; N=nrow(d))
+    p ~ Beta(1, 1)
+    y ~ filldist(Bernoulli(p), N)
+    return y
+end
+
+y_model = mybernoulli() | (;d.y)
+
+chain = sample(y_model, NUTS(), 1000)
+logjoint(y_model, chain)
+
+```
 
 
+```{julia}
+
+@model function logistic_regression(; N=nrow(d))
+    # Priors
+    alpha ~ MvNormal(zeros(2), 2.5)
+
+    # Likelihood
+    x ~ filldist(BernoulliLogit(alpha[1]), N)
+    y ~ filldist(BernoulliLogit(alpha[2]), N)
+    return (x=x, y=y)
+end
+
+logistic_model = logistic_regression() | (;x=d.x, y=d.y)
+chain = sample(logistic_model, NUTS(), 1000)
+logjoint(logistic_model, chain)
+
+```
+
+
+################################
 ## Vanilla regression
 
 We will use the same model as in the previous notebook, but now we will use Turing.jl to implement it.
