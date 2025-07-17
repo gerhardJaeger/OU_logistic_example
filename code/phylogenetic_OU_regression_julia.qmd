@@ -131,43 +131,6 @@ for t in pruned_trees
     droptips!(t, setdiff(getleafnames(t), taxa))
 end
 ```
-################################
-# Spielwiese
-
-```{julia}
-
-@model function mybernoulli(; N=nrow(d))
-    p ~ Beta(1, 1)
-    y ~ filldist(Bernoulli(p), N)
-    return y
-end
-
-y_model = mybernoulli() | (;d.y)
-
-chain = sample(y_model, NUTS(), 1000)
-logjoint(y_model, chain)
-
-```
-
-
-```{julia}
-
-@model function logistic_regression(; N=nrow(d))
-    # Priors
-    alpha ~ MvNormal(zeros(2), 2.5)
-
-    # Likelihood
-    x ~ filldist(BernoulliLogit(alpha[1]), N)
-    y ~ filldist(BernoulliLogit(alpha[2]), N)
-    return (x=x, y=y)
-end
-
-logistic_model = logistic_regression() | (;x=d.x, y=d.y)
-chain = sample(logistic_model, NUTS(), 1000)
-logjoint(logistic_model, chain)
-
-```
-
 
 ################################
 ## Vanilla regression
@@ -178,7 +141,7 @@ The likelihood is implemented as a Turing model like this:
 
 ```{julia}
 #| vscode: {languageId: julia}
-@model function vanilla_regression(x, y)
+@model function vanilla_regression(; x = d.x)
     N = length(x)
     # Center x
     means_x = mean(x)
@@ -191,6 +154,7 @@ The likelihood is implemented as a Turing model like this:
     # Linear predictor
     η = alpha .+ beta .* Xc
     
+    y = Vector{Int}(undef, N)
     # Likelihood
     for i in 1:N
         y[i] ~ BernoulliLogit(η[i])
@@ -198,6 +162,7 @@ The likelihood is implemented as a Turing model like this:
     
     loglik := [logpdf(BernoulliLogit(η[i]), y[i]) for i in 1:N]
     y_rep := [rand(BernoulliLogit(η[i])) for i in 1:N]
+    return (y=y, loglik=loglik, y_rep=y_rep)
 end
 ```
 
@@ -209,19 +174,20 @@ Let's run the model:
 ```{julia}
 #| vscode: {languageId: julia}
 
-# Run the model with actual data
-@time begin
-    chain_vanilla_regression = sample(
-        vanilla_regression(d.x, d.y),
-        NUTS(),
-        MCMCThreads(),
-        1000,
-        4,
-        discard_initial=1000,
-        progress=true,
-    )
+model_vanilla_regression = vanilla_regression() | (y = d.y, )
 
-end
+# Run the model
+
+chain_vanilla_regression = sample(
+    model_vanilla_regression,
+    NUTS(),
+    MCMCThreads(),
+    1000,
+    4,
+    discard_initial=1000,
+    progress=true,
+)
+
 # Print summary of the chain
 describe(chain_vanilla_regression[:, [:alpha, :beta], :])
 ```
@@ -287,8 +253,7 @@ Next we sample from the prior and the posterior. In Turing, this is fairly strai
 
 ```{julia}
 # Prior predictive sampling - sample from prior with missing y
-model_prior = vanilla_regression(d.x, fill(missing, length(d.x)))
-prior_chain = sample(model_prior, Prior(), 4000)
+prior_chain = sample(vanilla_regression(), Prior(), 4000)
 
 # Posterior predictive sampling - use the fitted chain
 
@@ -307,23 +272,10 @@ Next we compute the marginal log-likelihood and the LOOIC.
 
 ```{julia}
 #| vscode: {languageId: julia}
-
-function create_logdensity_function(model)
-    # Create a LogDensityProblems-compatible object
-    logdensity_obj = DynamicPPL.LogDensityFunction(model)
-
-    return function (params::Vector{Float64})
-        # Use LogDensityProblems.logdensity instead of DynamicPPL.logdensity
-        return LogDensityProblems.logdensity(logdensity_obj, params)
-    end
-end
-
-```
-
-```{julia}
-#| vscode: {languageId: julia}
 # Compute log-likelihood
-logdensity_func_vanilla_regression = create_logdensity_function(vanilla_regression(d.x, d.y))
+function logdensity_func_vanilla_regression(params::Vector{Float64})
+   logjoint(model_vanilla_regression, (alpha=params[1], beta=params[2]))
+end
 
 
 ```
@@ -456,34 +408,26 @@ println(loo_results_vanilla_regression)
 #| vscode: {languageId: julia}
 
 
-@model function vanilla_correlation(x, y)
-    N = length(y)
-
+@model function vanilla_correlation(; N = nrow(d))
     # Priors
-    mu ~ MvNormal(2, 2.0)
-    L_R ~ LKJCholesky(2, 1.0)
+    mu ~ filldist(Normal(0, 2.5), 2)
+    rho ~ Uniform(-1+1e-6, 1-1e-6)
+    Sigma = [
+        1  rho
+        rho 1
+    ]
+    z ~ filldist(MvNormal(mu, Sigma), N)
 
-    # Latent variables: raw standard normal vectors
-    # Sample standard normal
-    z_std = Matrix{Float64}(undef, 2, N)
-    for n in 1:N
-        z_std[:, n] ~ MvNormal(I(2))
-    end
+    x = Vector{Int}(undef, N)
+    y = Vector{Int}(undef, N)
+    x ~ product_distribution(BernoulliLogit.(z[1, :]))
+    y ~ product_distribution(BernoulliLogit.(z[2, :]))
 
-    # Transform outside the sampling statement
-    z = L_R.L * z_std .+ mu
-
-    # Likelihood
-    for n in 1:N
-        x[n] ~ BernoulliLogit(z[1, n])
-        y[n] ~ BernoulliLogit(z[2, n])
-    end
-
-    # Compute correlation from the correlation matrix
-    R = L_R.L * L_R.L'
-    rho  := R[1, 2]
+    loglik := [logpdf(BernoulliLogit(z[2, i]), y[i]) for i in 1:N]
+    y_rep := [rand(BernoulliLogit(z[2, i])) for i in 1:N]
     mu1 := mu[1]
     mu2 := mu[2]
+    return (x=x, y=y, mu1=mu1, mu2=mu2, loglik=loglik, y_rep=y_rep)
 end
 
 
@@ -492,19 +436,17 @@ end
 ```{julia}
 #| vscode: {languageId: julia}
 
-@time begin
-    model_vanilla_correlation = vanilla_correlation(d.x, d.y)
-    chain_vanilla_correlation = sample(
-        model_vanilla_correlation,
-        NUTS(),
-        MCMCThreads(),
-        200,
-        4,
-        discard_initial=200,
-        progress=true,
-    )
+model_vanilla_correlation = vanilla_correlation() | (x = d.x, y = d.y) 
+chain_vanilla_correlation = sample(
+    model_vanilla_correlation,
+    NUTS(),
+    MCMCThreads(),
+    200,
+    4,
+    discard_initial=200,
+    progress=true,
+)
 
-end
 # Print summary of the chain
 describe(
     chain_vanilla_correlation[:, [:mu1, :mu2, :rho], :]
@@ -534,18 +476,15 @@ Computing the marginal log-likelihood and LOOIC for the correlation model:
 ```{julia}
 # Compute log-likelihood
 
-logdensity_obj = DynamicPPL.LogDensityFunction(model_vanilla_correlation)
 
-DynamicPPL.link!!(logdensity_obj.varinfo, model_vanilla_correlation)
-
-sample_vanilla_correlation = Array(chain_vanilla_correlation)
-LogDensityProblems.logdensity(logdensity_obj, sample_vanilla_correlation[1,:])
-
-function logdensity_function_vanilla_correlation(params::Vector{Float64})
-    LogDensityProblems.logdensity(logdensity_obj, params)
+function logdensity_func_vanilla_correlation(params::Vector{Float64})
+   nms = names(chain_vanilla_correlation)[1:length(params)]
+   chn = Chains(reshape(params, 1, :), nms)
+   logjoint(model_vanilla_correlation, chn) |> first
 end
 
-logml_vanilla_correlation = bridge_sampling(sample_vanilla_correlation, logdensity_function_vanilla_correlation)
+
+logml_vanilla_correlation = bridge_sampling(Array(chain_vanilla_correlation), logdensity_func_vanilla_correlation)
 
 println("Marginal log-likelihood: ", logml_vanilla_correlation)
 
