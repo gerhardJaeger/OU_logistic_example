@@ -154,11 +154,8 @@ The likelihood is implemented as a Turing model like this:
     # Linear predictor
     η = alpha .+ beta .* Xc
     
-    y = Vector{Int}(undef, N)
+    y ~ product_distribution(BernoulliLogit.(η))
     # Likelihood
-    for i in 1:N
-        y[i] ~ BernoulliLogit(η[i])
-    end
     
     loglik := [logpdf(BernoulliLogit(η[i]), y[i]) for i in 1:N]
     y_rep := [rand(BernoulliLogit(η[i])) for i in 1:N]
@@ -411,15 +408,18 @@ println(loo_results_vanilla_regression)
 @model function vanilla_correlation(; N = nrow(d))
     # Priors
     mu ~ filldist(Normal(0, 2.5), 2)
-    rho ~ Uniform(-1+1e-6, 1-1e-6)
+    rhostar ~ Logistic(0, 1)
+    rho := 2 * logistic(rhostar) - 1
+    if abs(rho) >= 1
+        @show rho
+        error("rho must be in (-1, 1)")
+    end
     Sigma = [
         1  rho
         rho 1
     ]
     z ~ filldist(MvNormal(mu, Sigma), N)
 
-    x = Vector{Int}(undef, N)
-    y = Vector{Int}(undef, N)
     x ~ product_distribution(BernoulliLogit.(z[1, :]))
     y ~ product_distribution(BernoulliLogit.(z[2, :]))
 
@@ -483,10 +483,14 @@ function logdensity_func_vanilla_correlation(params::Vector{Float64})
    logjoint(model_vanilla_correlation, chn) |> first
 end
 
+samples = Array(chain_vanilla_correlation)
+log_density = logdensity_func_vanilla_correlation
 
-logml_vanilla_correlation = bridge_sampling(Array(chain_vanilla_correlation), logdensity_func_vanilla_correlation)
+logml_vanilla_correlation = bridge_sampling(samples,logdensity_func_vanilla_correlation)
 
 println("Marginal log-likelihood: ", logml_vanilla_correlation)
 
 
 ```
+
+## Todo: Jacobian correction for the correlation model
