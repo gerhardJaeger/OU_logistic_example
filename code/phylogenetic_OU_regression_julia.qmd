@@ -493,4 +493,4 @@ println("Marginal log-likelihood: ", logml_vanilla_correlation)
 
 ```
 
-## Todo: Jacobian correction for the correlation model
+## Todo: Trying out Pigeons.jl for path sampling
