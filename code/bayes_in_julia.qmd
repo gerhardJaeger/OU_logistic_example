@@ -14,7 +14,7 @@ Pkg.instantiate()
 
 ```
 
-There is a package called `Turing.jl` that is a powerful tool for Bayesian inference in Julia. It allows you to define probabilistic models and perform inference using various algorithms. Compared to the R/Stan ecosystem, Julia + Turing has both upsides and downside. The upside is that everything is written in one language, Julia, so you avoid the headache to come to grips with Stan. One of the downsides is that there are no off-the-shelf techniques for model comparison, so we will have to either implement them ourselves or to use the RCall interface to R.
+There is a package called `Turing.jl` that is a powerful tool for Bayesian inference in Julia. It allows you to define probabilistic models and perform inference using various algorithms. Compared to the R/Stan ecosystem, Julia + Turing has both upsides and downside. The main upside is that it allows to use both discrete and continuous distributions. Since the treatment of phylogenetic uncertainty requires marginalization over discrete entitites, this is a big plus. Another upside is that everything is written in one language, Julia, so you avoid the headache to come to grips with Stan. One of the downsides is that there are no off-the-shelf techniques for model comparison, so we will have to either implement them ourselves or to use the RCall interface to R.
 
 ```{julia}
 using Turing
