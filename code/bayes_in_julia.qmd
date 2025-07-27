@@ -16,6 +16,8 @@ Pkg.instantiate()
 
 There is a package called `Turing.jl` that is a powerful tool for Bayesian inference in Julia. It allows you to define probabilistic models and perform inference using various algorithms. Compared to the R/Stan ecosystem, Julia + Turing has both upsides and downside. The main upside is that it allows to use both discrete and continuous distributions. Since the treatment of phylogenetic uncertainty requires marginalization over discrete entitites, this is a big plus. Another upside is that everything is written in one language, Julia, so you avoid the headache to come to grips with Stan. One of the downsides is that there are no off-the-shelf techniques for model comparison, so we will have to either implement them ourselves or to use the RCall interface to R.
 
+We start with loading the necessary packages.
+
 ```{julia}
 using Turing
 using StatsPlots
@@ -24,6 +26,233 @@ using DataFrames
 using CSV
 using LinearAlgebra
 using Pigeons
+using Glob
+using Phylo
+using Pipe
+using StatsFuns
 ```
 
 
+Now we load the data.
+
+**Edge tree distribution**
+
+```{julia}
+# Create data directory if it doesn't exist
+isdir("../data") || mkpath("../data")
+
+# Paths
+tgz_url = "https://github.com/rbouckaert/global-language-tree-pipeline/releases/download/v1.0.0/all_trees.tgz"
+tgz_file = "../data/all_trees.tgz"
+tar_file = "../data/all_trees.tar"
+tree_dir = "../data/all_trees/"
+
+# Download and extract
+if !isdir(tree_dir)
+    Downloads.download(tgz_url, tgz_file)
+
+    # Decompress .tgz to .tar
+    open(tgz_file) do f_in
+        open(tar_file, "w") do f_out
+            write(f_out, transcode(GzipDecompressor, read(f_in)))
+        end
+    end
+
+    # Extract .tar archive
+    Tar.extract(tar_file, tree_dir)
+    # Move all files from ../data/all_trees/all_trees to ../data/all_trees
+    inner_dir = joinpath(tree_dir, "all_trees")
+    if isdir(inner_dir)
+        for f in readdir(inner_dir; join=true)
+            mv(f, joinpath(tree_dir, basename(f)); force=true)
+        end
+        rm(inner_dir; force=true, recursive=true)
+    end
+    # Clean up
+    rm(tgz_file)
+    rm(tar_file)
+end
+
+
+# Load all Newick trees
+tree_files = glob("*.tree", tree_dir)
+
+trees = [parsenewick(read(f, String)) for f in tree_files]
+
+# Optionally strip suffixes
+for tree in trees
+    for tip in getleaves(tree)
+        tip.name = split(tip.name, "_")[1]
+    end
+end
+
+```
+
+
+**Grambank data**
+
+
+```{julia}
+#| vscode: {languageId: julia}
+
+d = @pipe CSV.File("../data/grambank_vals_pruned.csv") |>
+          DataFrame |>
+          sort(_, :Language_ID)
+taxa = d.Language_ID
+```
+
+
+Now we prune the trees to only include the languages in the data.
+
+```{julia}
+#| vscode: {languageId: julia}
+pruned_trees = [deepcopy(t) for t in trees]
+for t in pruned_trees
+    droptips!(t, setdiff(getleafnames(t), taxa))
+end
+```
+
+Let us add a combined character `z` to the data, which is $2x+y-1$. 
+
+
+To illustrate the advantage of the Julia + Turing approach, I implemented the likelihood function for the joint model according to Pagel & Meade (2006) in Julia. The function `get_ll` computes the log-likelihood of the data given a tree and a rate matrix $Q$. The function `decompose_tree` is used to extract the necessary information from the tree structure.
+
+
+First we create the new character `z` in the data frame `d` that captures the possible combination states of the two characters `x` and `y`. The new character is defined as $z = 2x + y - 1$.
+
+
+```{julia}
+#| vscode: {languageId: julia}
+#| output: false
+
+d = @pipe d |> transform(_, [:x, :y] => ByRow((x, y) -> 2x + y + 1) => :z)
+
+```
+
+Then we add the likelihood function `get_ll` as a function of a tree `tree`, a rate matrix `Q`, tip labels `taxa`, and a vector `z` of states for the tip labels. The function `decompose_tree` is a helper function that extracts the necessary information from the tree structure.
+```{julia}
+
+function decompose_tree(
+    tree::RootedTree
+)::@NamedTuple{root::String, mothers::Vector{String}, daughters::Vector{String}, lengths::Vector{Float64}, nodes_dict::Dict{String, Int64}}
+    root = getroot(tree).name
+    mothers = String[]
+    daughters = String[]
+    lengths = Float64[]
+    for nd in traversal(tree, postorder)
+        if !isroot(tree, nd)
+            mother = getparent(tree, nd)
+            br = getinbound(tree, nd)
+            bl = getlength(tree, br)
+            push!(mothers, mother.name)
+            push!(daughters, nd.name)
+            push!(lengths, bl)
+        end
+    end
+
+    nodes = sort!(unique(vcat(mothers, daughters)))
+    nodes_dict = Dict{String, Int}(nodes .=> 1:length(nodes))
+    (root=root, mothers=mothers, daughters=daughters, lengths=lengths, nodes_dict=nodes_dict)
+end
+
+
+function get_P(
+    t::Float64,
+    U::Matrix{Float64},
+    U_inv::Matrix{Float64},
+    sigma::Vector{Float64}
+)::Matrix{Float64}
+    U * diagm(exp.(t*sigma)) * U_inv
+end
+
+function get_ll(
+    tree::RootedTree,
+    Q::Matrix{Float64};
+    taxa=d.Language_ID,
+    z::Vector{Int}=d.z
+)::Float64
+    sigma, U = eigen(Q)
+    U_inv = inv(U)
+    eq = (U * diagm([0,0,0,1]) * U_inv)[1,:]
+    root, mothers, daughters, lengths, nodes_dict = decompose_tree(tree)
+    ll = zeros(Float64, length(nodes_dict), maximum(z))
+    for (l, s) in zip(taxa, z)
+        ll[nodes_dict[l], :] .= -Inf
+        ll[nodes_dict[l], s] = 0.0
+    end
+    @views for i in eachindex(lengths)
+        dgt = nodes_dict[daughters[i]]
+        mth = nodes_dict[mothers[i]]
+        P = get_P(lengths[i], U, U_inv, sigma)
+        tmp = log.(P) .+ ll[dgt, :]'
+        for j in 1:size(tmp, 1)
+            ll[mth, j] += logsumexp(view(tmp, j, :))
+        end
+    end
+    logsumexp(ll[nodes_dict[root],:] + log.(eq))
+end
+```
+
+Now we create a Turing model using this likelihood function. The model will have a prior on the rate matrix $Q$ and will use the `get_ll` function to compute the log-likelihood of the data given the tree and the rate matrix.
+
+```{julia}
+
+function rates_to_matrix(rates::Vector{Float64})
+    Q = zeros(4, 4)
+    counter = 1
+    for i in 1:4, j in 1:4
+        if i != j
+            Q[i,j] = rates[counter]
+            counter += 1
+        end
+    end
+    for i in 1:4
+        Q[i,i] = -sum(Q[i,:])
+    end
+    return Q
+end
+
+
+
+@model function bayes_model(pruned_trees, taxa, z)
+    rates ~ filldist(Exponential(1.0), 12)
+    Q = rates_to_matrix(rates)
+    
+    tree_index ~ Categorical(ones(length(pruned_trees)) ./ length(pruned_trees))
+    tree = pruned_trees[tree_index]
+    ll = get_ll(tree, Q; taxa=taxa, z=z)
+    Turing.@addlogprob! ll
+    return (rates = rates, tree_index = tree_index)
+
+end
+
+```
+
+
+
+This model defines a prior on the rates using an exponential distribution, constructs the rate matrix $Q$ from the rates, and computes the log-likelihood of the data given the tree and the rate matrix using the `get_ll` function. The model can then be used for Bayesian inference using Turing's sampling algorithms.
+
+The main difference from the R/Stan approach is that we can simultaneously sample from the tree space and the rate space, which is not possible in Stan. In Stan, you would have to compute the likelihood for all trees in the tree sample in each sampling step, which is computationally expensive. In Julia + Turing, we can sample from the tree space and the rate space simultaneously, which is much more efficient.
+
+
+```{julia}
+model = bayes_model(pruned_trees, taxa, d.z)
+
+```
+
+
+Now we can run the model using Turing's sampling algorithms. For example, we can use the NUTS sampler to sample from the posterior distribution of the rates, and Particle Gibbs (PG) to sample from the tree space.
+
+
+```{julia}
+
+model = bayes_model(pruned_trees, d.Language_ID, d.z)
+
+sampler = Gibbs(
+    :tree_index => PG(10),
+    :rates => NUTS(500, 0.65)
+)
+
+chain = sample(model, sampler, 1000)
+
+```
