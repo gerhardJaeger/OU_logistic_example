@@ -134,7 +134,7 @@ Then we add the likelihood function `get_ll` as a function of a tree `tree`, a r
 
 function decompose_tree(
     tree::RootedTree
-)::@NamedTuple{root::String, mothers::Vector{String}, daughters::Vector{String}, lengths::Vector{Float64}, nodes_dict::Dict{String, Int64}}
+)::@NamedTuple{root::String, mothers::Vector{String}, daughters::Vector{String}, lengths::Vector{Float64}, nodes_dict::Dict{String,Int64}}
     root = getroot(tree).name
     mothers = String[]
     daughters = String[]
@@ -151,7 +151,7 @@ function decompose_tree(
     end
 
     nodes = sort!(unique(vcat(mothers, daughters)))
-    nodes_dict = Dict{String, Int}(nodes .=> 1:length(nodes))
+    nodes_dict = Dict{String,Int}(nodes .=> 1:length(nodes))
     (root=root, mothers=mothers, daughters=daughters, lengths=lengths, nodes_dict=nodes_dict)
 end
 
@@ -162,18 +162,28 @@ function get_P(
     U_inv::Matrix{Float64},
     sigma::Vector{Float64}
 )::Matrix{Float64}
-    U * diagm(exp.(t*sigma)) * U_inv
+    U * diagm(exp.(t * sigma)) * U_inv
 end
 
 function get_ll(
     tree::RootedTree,
-    Q::Matrix{Float64};
+    Q::AbstractMatrix;
     taxa=d.Language_ID,
     z::Vector{Int}=d.z
 )::Float64
-    sigma, U = eigen(Q)
+    F = eigen(Q)
+    sigma = real(F.values)
+    # Ensure all eigenvalues are non-positive (for a valid rate matrix)
+    if any(sigma .> 1e-10)
+        error("All eigenvalues of the rate matrix Q must be non-positive.")
+    end
+    U = real(F.vectors)
+
+    if cond(U) > 1e10
+        return -Inf
+    end
     U_inv = inv(U)
-    eq = (U * diagm([0,0,0,1]) * U_inv)[1,:]
+    eq = (U*diagm([0, 0, 0, 1])*U_inv)[1, :]
     root, mothers, daughters, lengths, nodes_dict = decompose_tree(tree)
     ll = zeros(Float64, length(nodes_dict), maximum(z))
     for (l, s) in zip(taxa, z)
@@ -189,40 +199,39 @@ function get_ll(
             ll[mth, j] += logsumexp(view(tmp, j, :))
         end
     end
-    logsumexp(ll[nodes_dict[root],:] + log.(eq))
+    logsumexp(ll[nodes_dict[root], :] + log.(eq))
 end
 ```
 
 Now we create a Turing model using this likelihood function. The model will have a prior on the rate matrix $Q$ and will use the `get_ll` function to compute the log-likelihood of the data given the tree and the rate matrix.
 
 ```{julia}
-
-function rates_to_matrix(rates::Vector{Float64})
-    Q = zeros(4, 4)
+function rates_to_matrix(rates::AbstractVector)
+    T = eltype(rates)
+    Q = zeros(T, 4, 4)
     counter = 1
     for i in 1:4, j in 1:4
         if i != j
-            Q[i,j] = rates[counter]
+            Q[i, j] = rates[counter]
             counter += 1
         end
     end
     for i in 1:4
-        Q[i,i] = -sum(Q[i,:])
+        Q[i, i] = -sum(Q[i, :])
     end
     return Q
 end
 
 
-
 @model function bayes_model(pruned_trees, taxa, z)
-    rates ~ filldist(Exponential(1.0), 12)
+    rates ~ filldist(LogNormal(0.0, 1.0), 12)
     Q = rates_to_matrix(rates)
-    
+
     tree_index ~ Categorical(ones(length(pruned_trees)) ./ length(pruned_trees))
     tree = pruned_trees[tree_index]
     ll = get_ll(tree, Q; taxa=taxa, z=z)
     Turing.@addlogprob! ll
-    return (rates = rates, tree_index = tree_index)
+    return (rates=rates, tree_index=tree_index)
 
 end
 
@@ -246,13 +255,14 @@ Now we can run the model using Turing's sampling algorithms. For example, we can
 
 ```{julia}
 
-model = bayes_model(pruned_trees, d.Language_ID, d.z)
-
-sampler = Gibbs(
-    :tree_index => PG(10),
-    :rates => NUTS(500, 0.65)
+chain = sample(
+    model,
+    MH(),
+    MCMCSerial(),
+    20_000,
+    4,
+    progress=true
 )
 
-chain = sample(model, sampler, 1000)
-
 ```
+
