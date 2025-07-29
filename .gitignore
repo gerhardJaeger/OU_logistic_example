@@ -1,4 +1,5 @@
-.ipynb_checkpoints/
+**/.ipynb_checkpoints/
 code/*.rds
+code/.localvscode
 data/all_trees/
 code/Manifest.toml
