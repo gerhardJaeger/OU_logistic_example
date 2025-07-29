@@ -30,6 +30,7 @@ using Glob
 using Phylo
 using Pipe
 using StatsFuns
+using ProgressMeter
 ```
 
 
@@ -158,61 +159,17 @@ end
 
 function get_P(
     t::Float64,
-    U::Matrix{Float64},
-    U_inv::Matrix{Float64},
-    sigma::Vector{Float64}
+    Q::AbstractMatrix{Float64},
 )::Matrix{Float64}
-    U * diagm(exp.(t * sigma)) * U_inv
+    exp(Q * t)
 end
 
-function get_ll(
-    tree::RootedTree,
-    Q::AbstractMatrix;
-    taxa=d.Language_ID,
-    z::Vector{Int}=d.z
-)::Float64
-    F = eigen(Q)
-    sigma = real(F.values)
-    # Ensure all eigenvalues are non-positive (for a valid rate matrix)
-    if any(sigma .> 1e-10)
-        error("All eigenvalues of the rate matrix Q must be non-positive.")
-    end
-    U = real(F.vectors)
-
-    if cond(U) > 1e10
-        return -Inf
-    end
-    U_inv = inv(U)
-    eq = (U*diagm([0, 0, 0, 1])*U_inv)[1, :]
-    root, mothers, daughters, lengths, nodes_dict = decompose_tree(tree)
-    ll = zeros(Float64, length(nodes_dict), maximum(z))
-    for (l, s) in zip(taxa, z)
-        ll[nodes_dict[l], :] .= -Inf
-        ll[nodes_dict[l], s] = 0.0
-    end
-    @views for i in eachindex(lengths)
-        dgt = nodes_dict[daughters[i]]
-        mth = nodes_dict[mothers[i]]
-        P = get_P(lengths[i], U, U_inv, sigma)
-        tmp = log.(P) .+ ll[dgt, :]'
-        for j in 1:size(tmp, 1)
-            ll[mth, j] += logsumexp(view(tmp, j, :))
-        end
-    end
-    logsumexp(ll[nodes_dict[root], :] + log.(eq))
-end
-```
-
-Now we create a Turing model using this likelihood function. The model will have a prior on the rate matrix $Q$ and will use the `get_ll` function to compute the log-likelihood of the data given the tree and the rate matrix.
-
-```{julia}
-function rates_to_matrix(rates::AbstractVector)
-    T = eltype(rates)
-    Q = zeros(T, 4, 4)
+function rates_to_matrix(rates::Vector{Float64})
+    Q = zeros(Float64, 4, 4)
     counter = 1
     for i in 1:4, j in 1:4
         if i != j
-            Q[i, j] = rates[counter]
+            Q[i, j] = min(rates[counter], 1e10)
             counter += 1
         end
     end
@@ -223,16 +180,64 @@ function rates_to_matrix(rates::AbstractVector)
 end
 
 
-@model function bayes_model(pruned_trees, taxa, z)
-    rates ~ filldist(LogNormal(0.0, 1.0), 12)
-    Q = rates_to_matrix(rates)
+function get_ll(
+    tree::RootedTree,
+    Q::AbstractMatrix;
+    taxa=d.Language_ID,
+    z::Vector{Int}=d.z
+)::Float64
+    eq = get_P(1000.0, Q)[:,1]
+    root, mothers, daughters, lengths, nodes_dict = decompose_tree(tree)
+    ll = zeros(Float64, length(nodes_dict), maximum(z))
+    for (l, s) in zip(taxa, z)
+        ll[nodes_dict[l], :] .= -Inf
+        ll[nodes_dict[l], s] = 0.0
+    end
+    @views for i in eachindex(lengths)
+        dgt = nodes_dict[daughters[i]]
+        mth = nodes_dict[mothers[i]]
+        P = get_P(lengths[i], Q)
+        tmp = log.(P) .+ ll[dgt, :]'
+        for j in 1:size(tmp, 1)
+            ll[mth, j] += logsumexp(view(tmp, j, :))
+        end
+    end
+    logsumexp(ll[nodes_dict[root], :] + log.(eq))
+end
+```
 
-    tree_index ~ Categorical(ones(length(pruned_trees)) ./ length(pruned_trees))
+Let us test whether the likelihood function works correctly.
+
+```{julia}
+@showprogress for _ in 1:10000
+    rates = exp.(rand(Normal(0,1), 12))
+    Q = rates_to_matrix(rates)
+    tree = rand(pruned_trees)
+    get_ll(tree, Q; taxa=taxa, z=d.z)
+end
+
+```
+
+
+Now we create a Turing model using this likelihood function. The model will have a prior on the rate matrix $Q$ and will use the `get_ll` function to compute the log-likelihood of the data given the tree and the rate matrix.
+
+```{julia}
+
+
+@model function bayes_model(pruned_trees, taxa, z)
+    urates ~ filldist(Normal(0.0, 1.0), 12)
+    rates = exp.(urates)  # lognormal prior
+    Q = rates_to_matrix(rates)
+    
+    latent_index ~ Normal(0.0, 1.0)
+    n = length(pruned_trees)
+    tree_index = clamp(Int(ceil(cdf(Normal(0.0, 1.0), latent_index) * n)), 1, n)
+
     tree = pruned_trees[tree_index]
+
     ll = get_ll(tree, Q; taxa=taxa, z=z)
     Turing.@addlogprob! ll
-    return (rates=rates, tree_index=tree_index)
-
+    return vcat(rates, [tree_index])
 end
 
 ```
@@ -258,7 +263,7 @@ Now we can run the model using Turing's sampling algorithms. For example, we can
 chain = sample(
     model,
     MH(),
-    MCMCSerial(),
+    MCMCThreads(),
     20_000,
     4,
     progress=true
@@ -266,3 +271,17 @@ chain = sample(
 
 ```
 
+```{julia}
+my_turing_target = TuringLogPotential(model)
+
+pt = pigeons(
+    target = my_turing_target,
+    record=[traces],
+    multithreaded=true
+)
+
+```
+
+
+```{julia}
+```
