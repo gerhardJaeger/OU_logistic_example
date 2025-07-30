@@ -31,6 +31,7 @@ using Phylo
 using Pipe
 using StatsFuns
 using ProgressMeter
+using Random
 ```
 
 
@@ -186,7 +187,7 @@ function get_ll(
     taxa=d.Language_ID,
     z::Vector{Int}=d.z
 )::Float64
-    eq = get_P(1000.0, Q)[:,1]
+    eq = get_P(1000.0, Q)[:, 1]
     root, mothers, daughters, lengths, nodes_dict = decompose_tree(tree)
     ll = zeros(Float64, length(nodes_dict), maximum(z))
     for (l, s) in zip(taxa, z)
@@ -210,7 +211,7 @@ Let us test whether the likelihood function works correctly.
 
 ```{julia}
 @showprogress for _ in 1:10000
-    rates = exp.(rand(Normal(0,1), 12))
+    rates = exp.(rand(Normal(0, 1), 12))
     Q = rates_to_matrix(rates)
     tree = rand(pruned_trees)
     get_ll(tree, Q; taxa=taxa, z=d.z)
@@ -228,7 +229,7 @@ Now we create a Turing model using this likelihood function. The model will have
     urates ~ filldist(Normal(0.0, 1.0), 12)
     rates = exp.(urates)  # lognormal prior
     Q = rates_to_matrix(rates)
-    
+
     latent_index ~ Normal(0.0, 1.0)
     n = length(pruned_trees)
     tree_index = clamp(Int(ceil(cdf(Normal(0.0, 1.0), latent_index) * n)), 1, n)
@@ -254,9 +255,7 @@ model = bayes_model(pruned_trees, taxa, d.z)
 
 ```
 
-
-Now we can run the model using Turing's sampling algorithms. For example, we can use the NUTS sampler to sample from the posterior distribution of the rates, and Particle Gibbs (PG) to sample from the tree space.
-
+We can now sample from the model using the Metropolis-Hastings algorithm with MCMCThreads. This will allow us to sample from the posterior distribution of the rates and the tree index.
 
 ```{julia}
 
@@ -271,19 +270,58 @@ chain = sample(
 
 ```
 
-```{julia}
-my_turing_target = TuringLogPotential(model)
 
-pt = pigeons(
-    target = my_turing_target,
-    record=[traces],
-    multithreaded=true
-)
+```{julia}
+struct CTMCdependent
+    trees::Vector{RootedTree}
+    taxa::Vector{String}
+    z::Vector{Int}
+    posterior::Bool
+end
+
+function (ctmc_dependent::CTMCdependent)(pars)
+    ndim = length(pars)
+    ll = logpdf(MvNormal(zeros(ndim), ones(ndim)), pars)
+    if ctmc_dependent.posterior
+        urates = pars[1:(end-1)]
+        rates = exp.(urates)
+        Q = rates_to_matrix(rates)
+        latent_index = pars[end]
+        n = length(ctmc_dependent.trees)
+        tree_index = clamp(Int(ceil(cdf(Normal(0.0, 1.0), latent_index) * n)), 1, n)
+        tree = ctmc_dependent.trees[tree_index]
+        ll += get_ll(tree, Q; taxa=ctmc_dependent.taxa, z=ctmc_dependent.z)
+    end
+    return ll
+end
 
 ```
 
 
 ```{julia}
+ctmc_dependent = CTMCdependent(pruned_trees, taxa, d.z, true)
 
+ctmc_dependent(zeros(13))
+
+```
+
+```{julia}
+
+Pigeons.initialization(::CTMCdependent, ::AbstractRNG, ::Int) = zeros(13)
+pt = pigeons(
+        target = CTMCdependent(pruned_trees, taxa, d.z, true),
+        reference =  CTMCdependent(pruned_trees, taxa, d.z, false),
+        multithreaded = true,
+        record = [traces; record_default()]
+    )
+
+```
+
+```{julia}
 stepping_stone(pt)
+```
+
+```{julia}
+using InferenceReport
+report(pt)
 ```
