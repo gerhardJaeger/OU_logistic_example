@@ -271,7 +271,7 @@ Next we compute the marginal log-likelihood and the LOOIC.
 ```{julia}
 vanilla_regression_target = TuringLogPotential(vanilla_regression() | (x = d.x, y = d.y))
 pt = pigeons(target = vanilla_regression_target, multithreaded = true)
-print(stepping_stone(pt))
+println(stepping_stone(pt))
 
 ```
 
@@ -395,8 +395,15 @@ Computing the marginal log-likelihood and LOOIC for the correlation model:
 ```{julia}
 
 vanilla_correlation_target = TuringLogPotential(model_vanilla_correlation)
+
 pt = pigeons(target = vanilla_correlation_target, multithreaded = true)
-print(stepping_stone(pt))
+
+println(stepping_stone(pt))
+
+
+```
+
+```{julia}
 
 
 ```
