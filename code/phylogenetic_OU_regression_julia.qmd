@@ -24,6 +24,7 @@ Pkg.instantiate()
 ## Loading the required packages
 
 ```{julia}
+using AdvancedMH
 using CodecZlib: GzipDecompressor
 using CSV
 using DataFrames
@@ -142,7 +143,7 @@ The likelihood is implemented as a Turing model like this:
 
 ```{julia}
 #| vscode: {languageId: julia}
-@model function vanilla_regression(; x = d.x)
+@model function vanilla_regression(; x=d.x)
     N = length(x)
     # Center x
     means_x = mean(x)
@@ -154,10 +155,10 @@ The likelihood is implemented as a Turing model like this:
 
     # Linear predictor
     η = alpha .+ beta .* Xc
-    
+
     y ~ product_distribution(BernoulliLogit.(η))
     # Likelihood
-    
+
     loglik := [logpdf(BernoulliLogit(η[i]), y[i]) for i in 1:N]
     y_rep := [rand(BernoulliLogit(η[i])) for i in 1:N]
     return (y=y, loglik=loglik, y_rep=y_rep)
@@ -172,7 +173,7 @@ Let's run the model:
 ```{julia}
 #| vscode: {languageId: julia}
 
-model_vanilla_regression = vanilla_regression() | (y = d.y, )
+model_vanilla_regression = vanilla_regression() | (y=d.y,)
 
 # Run the model
 
@@ -269,8 +270,8 @@ predictive_checks_regression(y_rep, y_prior)
 Next we compute the marginal log-likelihood and the LOOIC.
 
 ```{julia}
-vanilla_regression_target = TuringLogPotential(vanilla_regression() | (x = d.x, y = d.y))
-pt = pigeons(target = vanilla_regression_target, multithreaded = true)
+vanilla_regression_target = TuringLogPotential(vanilla_regression() | (x=d.x, y=d.y))
+pt = pigeons(target=vanilla_regression_target, multithreaded=true)
 println(stepping_stone(pt))
 
 ```
@@ -325,17 +326,17 @@ println(loo_results_vanilla_regression)
 #| vscode: {languageId: julia}
 
 
-@model function vanilla_correlation(; N = nrow(d))
+@model function vanilla_correlation(; N=nrow(d))
     # Priors
     mu ~ filldist(Normal(0, 2.5), 2)
     rhostar ~ Logistic(0, 1)
-    rho := (1-1e-5)*(2 * logistic(rhostar) - 1)
+    rho := (1 - 1e-5) * (2 * logistic(rhostar) - 1)
     if abs(rho) >= 1
         @show rho
         error("rho must be in (-1, 1)")
     end
     Sigma = [
-        1  rho
+        1 rho
         rho 1
     ]
     z ~ filldist(MvNormal(mu, Sigma), N)
@@ -356,7 +357,7 @@ end
 ```{julia}
 #| vscode: {languageId: julia}
 
-model_vanilla_correlation = vanilla_correlation() | (x = d.x, y = d.y) 
+model_vanilla_correlation = vanilla_correlation() | (x=d.x, y=d.y)
 chain_vanilla_correlation = sample(
     model_vanilla_correlation,
     NUTS(),
@@ -396,7 +397,7 @@ Computing the marginal log-likelihood and LOOIC for the correlation model:
 
 vanilla_correlation_target = TuringLogPotential(model_vanilla_correlation)
 
-pt = pigeons(target = vanilla_correlation_target, multithreaded = true)
+pt = pigeons(target=vanilla_correlation_target, multithreaded=true)
 
 println(stepping_stone(pt))
 
@@ -405,5 +406,92 @@ println(stepping_stone(pt))
 
 ```{julia}
 
+function get_vcv(tree; taxa=taxa)
+    root = getroot(tree)
+    tips = getleaves(tree)
+    tip_names = getleafnames(tree)
+    vcv = zeros(length(tips), length(tips))
+
+    # Compute VCV matrix (upper triangle only)
+    for i in 1:length(tips)
+        for j in i:length(tips)
+            if i == j
+                # Diagonal: total distance from root to tip (variance)
+                vcv[i, j] = distance(tree, root, tips[i])
+            else
+                # Off-diagonal: shared evolutionary time (distance from root to MRCA)
+                vcv[j, i] = vcv[i, j] = distance(tree, root, mrca(tree, [tips[i], tips[j]]))
+            end
+        end
+    end
+    return vcv[indexin(tip_names, taxa), indexin(tip_names, taxa)]
+end
+
+```
+
+```{julia}
+
+vcv_matrices = [get_vcv(t, taxa=taxa) for t in pruned_trees]
+
+```
+
+```{julia}
+@model function brownian_regression(vcv_matrices, x)
+    n_data = length(x)
+    n_trees = length(vcv_matrices)
+    # Center x
+    means_x = mean(x)
+    Xc = x .- means_x
+
+    # Priors
+    alpha ~ LocationScale(0, 2.5, TDist(3))
+    beta ~ Normal(0, 2)
+    urate ~ Normal(0, 1)
+    rate := exp(urate)
+    # latent_index ~ Normal(0, 1)
+    # tree_index := clamp(Int(ceil(cdf(Normal(0.0, 1.0), latent_index) * n_trees)), 1, n_trees)
+    tree_index ~ Categorical(ones(n_trees) ./ n_trees)
+
+    ε = 1e-6
+    vcv = vcv_matrices[tree_index] + ε * I
+    random_effects ~ MvNormal(zeros(n_data), rate * vcv)
+
+    # Linear predictor
+    η = alpha .+ beta .* Xc + random_effects
+
+    y ~ product_distribution(BernoulliLogit.(η))
+    # Likelihood
+
+    loglik := [logpdf(BernoulliLogit(η[i]), y[i]) for i in 1:n_data]
+    y_rep := [rand(BernoulliLogit(η[i])) for i in 1:n_data]
+    return (y=y, loglik=loglik, y_rep=y_rep, rate=rate, tree_index=tree_index)
+end
+
+
+```
+
+
+```{julia}
+#| vscode: {languageId: julia}
+
+model_brownian_regression = brownian_regression(vcv_matrices, x) | (y=d.y,)
+
+
+
+chain_brownian_regression = sample(
+    model_brownian_regression,
+    Gibbs(
+        :tree_index => PG(100),
+        (:alpha, :beta, :urate, :random_effects) => NUTS(),
+    ),
+    100,
+    progress=true,
+)
+
+# Print summary of the chain
+display(chain_brownian_regression[:, [:alpha, :beta, :rate, :tree_index], :])
+
+
+plot(chain_brownian_regression[:, [:alpha, :beta, :rate, :tree_index], :])
 
 ```
