@@ -480,14 +480,6 @@ println(loo_results_vanilla_correlation)
 
 
 ```{julia}
-# Print LOO results
-println("LOO Results:")
-loo_results_vanilla_correlation = format_loo_results(loo_vanilla_correlation)
-println(loo_results_vanilla_correlation)
-```
-
-
-```{julia}
 
 function get_vcv(tree; taxa=taxa)
     root = getroot(tree)
@@ -568,14 +560,33 @@ end
 ```{julia}
 #| vscode: {languageId: julia}
 
+using AdvancedMH
+using AdvancedHMC
+using DynamicPPL: StepScheduler
+
+
 model_brownian_regression = brownian_regression(vcv_matrices, d.x, d.y)
+
+
+
+nuts_sampler = Turing.NUTS()
+mh_sampler   = MH()
+
+scheduler = StepScheduler(
+    [
+        (:tree_index, mh_sampler) => 10,           # run MH 10 times per cycle
+        ((:α, :β, :rate), nuts_sampler) => 1       # run NUTS once per cycle
+    ]
+)
+
+
+
 chain_brownian_regression = sample(
     model_brownian_regression,
-    Gibbs(
-        :tree_index => MH(),
-        (:α, :β, :rate) => NUTS()
-    ),
-    20,
+    Gibbs(scheduler),
+    MCMCThreads(),
+    200,
+    4,
     progress=true,
 )
 
@@ -585,4 +596,7 @@ display(chain_brownian_regression[:, [:α, :β, :rate, :tree_index], :])
 
 plot(chain_brownian_regression[:, [:α, :β, :rate, :tree_index], :])
 
+```
+
+```{julia}
 ```
