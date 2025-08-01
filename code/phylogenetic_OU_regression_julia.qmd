@@ -562,7 +562,6 @@ end
 
 using AdvancedMH
 using AdvancedHMC
-using DynamicPPL: StepScheduler
 
 
 model_brownian_regression = brownian_regression(vcv_matrices, d.x, d.y)
@@ -572,18 +571,18 @@ model_brownian_regression = brownian_regression(vcv_matrices, d.x, d.y)
 nuts_sampler = Turing.NUTS()
 mh_sampler   = MH()
 
-scheduler = StepScheduler(
-    [
-        (:tree_index, mh_sampler) => 100,          # run MH 100 times per cycle
-        ((:α, :β, :rate), nuts_sampler) => 1       # run NUTS once per cycle
-    ]
+# Create a Gibbs sampler with custom scheduling
+# Run MH 100 times for tree_index, then NUTS once for the other parameters
+gibbs_sampler = Gibbs(
+    (:tree_index, mh_sampler, 100),          # run MH 100 times for tree_index
+    ((:α, :β, :rate), nuts_sampler, 1)       # run NUTS once for α, β, rate
 )
 
 
 
 chain_brownian_regression = sample(
     model_brownian_regression,
-    Gibbs(scheduler),
+    gibbs_sampler,
     MCMCThreads(),
     200,
     4,
