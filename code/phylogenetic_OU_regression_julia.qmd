@@ -574,7 +574,7 @@ mh_sampler   = MH()
 
 scheduler = StepScheduler(
     [
-        (:tree_index, mh_sampler) => 10,           # run MH 10 times per cycle
+        (:tree_index, mh_sampler) => 100,          # run MH 100 times per cycle
         ((:α, :β, :rate), nuts_sampler) => 1       # run NUTS once per cycle
     ]
 )
