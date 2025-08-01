@@ -358,17 +358,10 @@ println(loo_results_vanilla_regression)
 
     x := Int.(xy .> 2)
     y := Int.((xy .== 2) .| (xy .== 4))
-    p_y = [p_x0[1], p_x1[1]][x .+ 1]
+    p_y = [p_x0, p_x1][x .+ 1]
 
-    y_rep = Array{Int}(undef, N)
-    loglik = [logpdf(Bernoulli(p_y[i]), y[i]) for i in 1:N]
-    for i in 1:N
-        if xy[i] < 3
-            y_rep[i] = rand(Bernoulli(p_x0[1]))
-        else
-            y_rep[i] = rand(Bernoulli(p_x1[1]))
-        end
-    end
+    y_rep := [rand(Bernoulli(p_y[i][2])) for i in 1:N]
+    loglik := [logpdf(Bernoulli(p_y[i][2]), y[i]) for i in 1:N]
 
     mu1 := mu[1]
     mu2 := mu[2]
@@ -442,7 +435,7 @@ println(stepping_stone(pt))
 
 
 ```{julia}
-# Prior predictive sampling - sample from prior with missing y
+# Prior predictive sampling 
 prior_chain = Turing.sample(vanilla_correlation(nrow(d)), Prior(), 4000)
 
 # Posterior predictive sampling - use the fitted chain
