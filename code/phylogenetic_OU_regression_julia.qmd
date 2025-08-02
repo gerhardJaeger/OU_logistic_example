@@ -358,7 +358,7 @@ println(loo_results_vanilla_regression)
 
     x := Int.(xy .> 2)
     y := Int.((xy .== 2) .| (xy .== 4))
-    p_y = [p_x0, p_x1][x .+ 1]
+    p_y = [p_x0, p_x1][x.+1]
 
     y_rep := [rand(Bernoulli(p_y[i][2])) for i in 1:N]
     loglik := [logpdf(Bernoulli(p_y[i][2]), y[i]) for i in 1:N]
@@ -508,94 +508,56 @@ end
 
 vcv_matrices = [get_vcv(t, taxa=taxa) for t in pruned_trees]
 
-```
-
-
-
-```{julia}
-
-n_data = length(d.x)
-n_trees = length(vcv_matrices)
-α = rand(LocationScale(0, 2.5, TDist(3)))
-β = rand(Normal(0, 2))
-u_rate = rand(Normal(0, 1))
-rate = exp(u_rate)
-vcv = rand(vcv_matrices)
-η = α .+ β .* d.x
-
-
-a = log.(d.y)
-b = -log.(1 .- d.y)
-ll = log(mvnormcdf(η, rate * vcv, a, b)[1])
+cholesky_matrices = [cholesky(vcv).L for vcv in vcv_matrices]
 
 ```
 
 
 ```{julia}
-@model function brownian_regression(vcv_matrices, x, y)
+@model function brownian_regression(cholesky_matrices, x)
     n_data = length(x)
-    n_trees = length(vcv_matrices)
+    n_trees = length(cholesky_matrices)
 
     # Priors
     α ~ LocationScale(0, 2.5, TDist(3))
     β ~ Normal(0, 2)
     u_rate ~ Normal(0, 1)
     rate := exp(u_rate)
-    # latent_index ~ Normal(0, 1)
-    # tree_index := clamp(Int(ceil(cdf(Normal(0.0, 1.0), latent_index) * n_trees)), 1, n_trees)
     tree_index ~ Categorical(ones(n_trees) ./ n_trees)
+    cm = cholesky_matrices[tree_index]
+    m = cm * sqrt(rate)
+    z_std ~ MvNormal(n_data, 1.0)
+    z = α .+ β .* x .+ sqrt(rate) * (m * z_std)
+    y ~ product_distribution(Bernoulli.(cdf.(Normal(), z)))
+end
 
-    vcv = vcv_matrices[tree_index]
-    a = map(yi -> yi == 1 ? 0.0 : -Inf, y)
-    b = map(yi -> yi == 1 ? Inf : 0.0, y)
+```
 
-    ll = log(mvnormcdf(α .+ β .* x, rate * vcv, a, b)[1])
-    Turing.@addlogprob! ll
+```{julia}
+
+function brownian_regression_target_fn(cholesky_matrices = cholesky_matrices, x = d.x, y = d.y)
+    return Pigeons.TuringLogPotential(brownian_regression(cholesky_matrices, x) | (y=y,))
+end
+
+BrownianRegressionType = typeof(brownian_regression_target_fn())
+
+function Pigeons.initialization(target::BrownianRegressionType, rng::AbstractRNG, ::Int64)
+    result = DynamicPPL.VarInfo(rng, target.model, DynamicPPL.SampleFromPrior(), DynamicPPL.PriorContext())
+    result = DynamicPPL.link(result, target.model)
+
+    for i in 1:length(d.x)
+        Pigeons.update_state!(result, :z_std, i, 0.0)
+    end
+    return result
 end
 
 
-```
-
-
-```{julia}
-#| vscode: {languageId: julia}
-
-using AdvancedMH
-using AdvancedHMC
-
-
-model_brownian_regression = brownian_regression(vcv_matrices, d.x, d.y)
-
-
-
-nuts_sampler = Turing.NUTS()
-mh_sampler   = MH()
-
-# Create a Gibbs sampler with custom scheduling
-# Run MH 100 times for tree_index, then NUTS once for the other parameters
-gibbs_sampler = Gibbs(
-    (:tree_index, mh_sampler, 100),          # run MH 100 times for tree_index
-    ((:α, :β, :rate), nuts_sampler, 1)       # run NUTS once for α, β, rate
+pt = pigeons(
+    target = brownian_regression_target_fn(),
+    multithreaded = true,
+    record = [traces; record_default()]
 )
 
-
-
-chain_brownian_regression = sample(
-    model_brownian_regression,
-    gibbs_sampler,
-    MCMCThreads(),
-    200,
-    4,
-    progress=true,
-)
-
-# Print summary of the chain
-display(chain_brownian_regression[:, [:α, :β, :rate, :tree_index], :])
-
-
-plot(chain_brownian_regression[:, [:α, :β, :rate, :tree_index], :])
-
 ```
 
-```{julia}
-```
+
