@@ -272,8 +272,8 @@ Next we compute the marginal log-likelihood and the LOOIC.
 
 ```{julia}
 vanilla_regression_target = TuringLogPotential(vanilla_regression() | (y=d.y,))
-pt = pigeons(target=vanilla_regression_target, multithreaded=true)
-println(stepping_stone(pt))
+pt_vanilla_regression = pigeons(target=vanilla_regression_target, multithreaded=true)
+println(stepping_stone(pt_vanilla_regression))
 
 ```
 
@@ -424,12 +424,12 @@ Computing the marginal log-likelihood and LOOIC for the correlation model:
 target = TuringLogPotential(vanilla_correlation(nrow(d)) | (xy=xy,))
 
 
-pt = pigeons(
+pt_vanilla_correlation = pigeons(
     target=target,
     multithreaded=true,
 )
 
-println(stepping_stone(pt))
+println(stepping_stone(pt_vanilla_correlation))
 ```
 
 
@@ -508,7 +508,7 @@ end
 
 vcv_matrices = [get_vcv(t, taxa=taxa) for t in pruned_trees]
 
-cholesky_matrices = [cholesky(vcv).L for vcv in vcv_matrices]
+cholesky_matrices = [cholesky(vcv / 100).L for vcv in vcv_matrices] # rescaling tree heights
 
 ```
 
@@ -517,18 +517,22 @@ cholesky_matrices = [cholesky(vcv).L for vcv in vcv_matrices]
 @model function brownian_regression(cholesky_matrices, x)
     n_data = length(x)
     n_trees = length(cholesky_matrices)
+    # Center x
+    means_x = mean(x)
 
     # Priors
     α ~ LocationScale(0, 2.5, TDist(3))
     β ~ Normal(0, 2)
     u_rate ~ Normal(0, 1)
     rate := exp(u_rate)
-    tree_index ~ Categorical(ones(n_trees) ./ n_trees)
+    latent_index ~ Normal()
+    tree_index := Int(ceil(cdf(Normal(), latent_index) * n_trees))
     cm = cholesky_matrices[tree_index]
     m = cm * sqrt(rate)
     z_std ~ MvNormal(n_data, 1.0)
-    z = α .+ β .* x .+ sqrt(rate) * (m * z_std)
+    z = α .+ β .* means_x .+  (m * z_std)
     y ~ product_distribution(Bernoulli.(cdf.(Normal(), z)))
+    return (α=α, β=β, rate=rate, tree_index=tree_index)
 end
 
 ```
@@ -544,20 +548,51 @@ BrownianRegressionType = typeof(brownian_regression_target_fn())
 function Pigeons.initialization(target::BrownianRegressionType, rng::AbstractRNG, ::Int64)
     result = DynamicPPL.VarInfo(rng, target.model, DynamicPPL.SampleFromPrior(), DynamicPPL.PriorContext())
     result = DynamicPPL.link(result, target.model)
-
+    Pigeons.update_state!(result, :latent_index, 1, rand(Normal()))
     for i in 1:length(d.x)
         Pigeons.update_state!(result, :z_std, i, 0.0)
     end
     return result
 end
 
-
-pt = pigeons(
+inputs_brownian_regression = Inputs(
     target = brownian_regression_target_fn(),
     multithreaded = true,
     record = [traces; record_default()]
 )
 
+
+pt_brownian_regression = pigeons(inputs_brownian_regression)
+
 ```
 
 
+```{julia}
+
+println(stepping_stone(pt_brownian_regression))
+
+```
+
+
+```{julia}
+
+sarray = sample_array(pt_brownian_regression)[:,:,1]
+snames = sample_names(pt_brownian_regression)
+
+df_brownian_regression = DataFrame(sarray, :auto)
+rename!(df_brownian_regression, snames)
+insertcols!(
+    df_brownian_regression,
+    1,
+    :tree_index => [Int(ceil(cdf(Normal(), v) * length(pruned_trees))) for v in df_brownian_regression.latent_index],
+    :rate => exp.(df_brownian_regression.u_rate)
+)
+
+samples = Chains(Array(df_brownian_regression), names(df_brownian_regression))
+
+
+samples[:, [:α, :β, :rate, :tree_index], :] |> display
+
+samples[:, [:α, :β, :rate, :tree_index], :] |> plot
+
+```
