@@ -101,7 +101,6 @@ end
 Random.seed!(1234)  # Set seed for reproducibility
 d = @pipe CSV.File("../data/grambank_vals_pruned.csv") |>
           DataFrame |>
-          _[rand(1:nrow(_), 20), :] |>
           sort(_, :Language_ID)
 taxa = d.Language_ID
 ```
@@ -111,7 +110,7 @@ Now we prune the trees to only include the languages in the data.
 
 ```{julia}
 #| vscode: {languageId: julia}
-pruned_trees = [deepcopy(t) for t in rand(trees, 50)]
+pruned_trees = [deepcopy(t) for t in rand(trees, 100)]
 for t in pruned_trees
     droptips!(t, setdiff(getleafnames(t), taxa))
 end
@@ -245,7 +244,6 @@ Now we create a Turing model using this likelihood function. The model will have
 end
 
 ```
-
 
 
 This model defines a prior on the rates using an exponential distribution, constructs the rate matrix $Q$ from the rates, and computes the log-likelihood of the data given the tree and the rate matrix using the `get_ll` function. The model can then be used for Bayesian inference using Turing's sampling algorithms.
@@ -402,4 +400,7 @@ plot(chains_brownian_regression_recursive[:, ["alpha", "beta", "urate", "latent_
 )
 
 
+```
+
+```{julia}
 ```
