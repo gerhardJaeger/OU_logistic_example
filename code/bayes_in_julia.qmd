@@ -32,6 +32,8 @@ using Pipe
 using StatsFuns
 using ProgressMeter
 using Random
+using LogDensityProblems
+using DynamicPPL
 ```
 
 
@@ -310,11 +312,11 @@ ctmc_dependent(zeros(13))
 
 Pigeons.initialization(::CTMCdependent, ::AbstractRNG, ::Int) = zeros(13)
 pt = pigeons(
-        target = CTMCdependent(pruned_trees, taxa, d.z, true),
-        reference =  CTMCdependent(pruned_trees, taxa, d.z, false),
-        multithreaded = true,
-        record = [traces; record_default()]
-    )
+    target=CTMCdependent(pruned_trees, taxa, d.z, true),
+    reference=CTMCdependent(pruned_trees, taxa, d.z, false),
+    multithreaded=true,
+    record=[traces; record_default()]
+)
 
 ```
 
@@ -323,17 +325,81 @@ stepping_stone(pt)
 ```
 
 ```{julia}
-x = d.x
-y = d.y
-alpha = rand(LocationScale(0, 2.5, TDist(3)))
-beta = rand(Normal(0, 2))
-tree = rand(pruned_trees)
-rate = exp(rand(Normal()))
-mu = rand(Normal(0, 2))
+
+@model function brownian_regression_recursive(pruned_trees, taxa, x)
+    alpha ~ LocationScale(0, 2.5, TDist(3))
+    beta ~ Normal(0, 2)
+    latent_index ~ Normal(0.0, 1.0)
+    n = length(pruned_trees)
+    tree_index = clamp(Int(ceil(cdf(Normal(0.0, 1.0), latent_index) * n)), 1, n)
+    tree = pruned_trees[tree_index]
+    urate ~ Normal()
+    rate := exp(urate)
+
+    root, mothers, daughters, lengths, nodes_dict = decompose_tree(tree)
+    z_std ~ MvNormal(zeros(length(mothers)), ones(length(mothers)))
+    z = zeros(Float64, length(nodes_dict))
+    z[nodes_dict[root]] = 0.0
+    for i in length(mothers):-1:1
+        dgt = nodes_dict[daughters[i]]
+        mth = nodes_dict[mothers[i]]
+        z[dgt] = z[mth] + sqrt(rate * lengths[i]) * z_std[i]
+    end
+    z_tips = [z[nodes_dict[l]] for l in taxa]
+    eta = alpha .+ beta * (x .- mean(x)) + z_tips
+
+    y ~ product_distribution(BernoulliLogit.(eta))
+end
+
+```
 
 
-root, mothers, daughters, lengths, nodes_dict = decompose_tree(tree)
+```{julia}
 
+function brownian_regression_recursive_target(pruned_trees=pruned_trees, taxa=taxa, x=d.x, y=d.y)
+    return Pigeons.TuringLogPotential(brownian_regression_recursive(pruned_trees, taxa, d.x) | (y=d.y,))
+end
+
+BrownianRegressionRecursiveType = typeof(brownian_regression_recursive_target())
+
+function Pigeons.initialization(target::BrownianRegressionRecursiveType, rng::AbstractRNG, ::Int64)
+    # First run the model to populate all variables
+    result = DynamicPPL.VarInfo(rng, target.model, DynamicPPL.SampleFromPrior(), DynamicPPL.PriorContext())
+
+    # Link the variables to their transformed space
+    result = DynamicPPL.link(result, target.model)
+
+    return result
+end
+
+inputs_brownian_regression_recursive = Inputs(
+    target=brownian_regression_recursive_target(),
+    multithreaded=true,
+    record=[traces; record_default()]
+)
+
+
+pt_brownian_regression_recursive = pigeons(inputs_brownian_regression_recursive)
+
+```
+
+
+```{julia}
+println(stepping_stone(pt_brownian_regression_recursive))
+
+```
+
+```{julia}
+
+chains_brownian_regression_recursive = Chains(
+    sample_array(pt_brownian_regression_recursive),
+    sample_names(pt_brownian_regression_recursive)
+)
+
+chains_brownian_regression_recursive[:, ["alpha", "beta", "urate", "latent_index"], :]
+
+plot(chains_brownian_regression_recursive[:, ["alpha", "beta", "urate", "latent_index"], :]
+)
 
 
 ```
