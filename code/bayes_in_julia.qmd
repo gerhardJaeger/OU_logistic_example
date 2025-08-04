@@ -96,9 +96,10 @@ end
 
 ```{julia}
 #| vscode: {languageId: julia}
-
+Random.seed!(1234)  # Set seed for reproducibility
 d = @pipe CSV.File("../data/grambank_vals_pruned.csv") |>
           DataFrame |>
+          _[rand(1:nrow(_), 20), :] |>
           sort(_, :Language_ID)
 taxa = d.Language_ID
 ```
@@ -108,7 +109,7 @@ Now we prune the trees to only include the languages in the data.
 
 ```{julia}
 #| vscode: {languageId: julia}
-pruned_trees = [deepcopy(t) for t in trees]
+pruned_trees = [deepcopy(t) for t in rand(trees, 50)]
 for t in pruned_trees
     droptips!(t, setdiff(getleafnames(t), taxa))
 end
@@ -322,6 +323,17 @@ stepping_stone(pt)
 ```
 
 ```{julia}
-using InferenceReport
-report(pt)
+x = d.x
+y = d.y
+alpha = rand(LocationScale(0, 2.5, TDist(3)))
+beta = rand(Normal(0, 2))
+tree = rand(pruned_trees)
+rate = exp(rand(Normal()))
+mu = rand(Normal(0, 2))
+
+
+root, mothers, daughters, lengths, nodes_dict = decompose_tree(tree)
+
+
+
 ```
