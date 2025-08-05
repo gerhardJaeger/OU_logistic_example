@@ -101,6 +101,7 @@ end
 Random.seed!(1234)  # Set seed for reproducibility
 d = @pipe CSV.File("../data/grambank_vals_pruned.csv") |>
           DataFrame |>
+          _[rand(1:nrow(_), 20), :] |>
           sort(_, :Language_ID)
 taxa = d.Language_ID
 ```
@@ -110,7 +111,7 @@ Now we prune the trees to only include the languages in the data.
 
 ```{julia}
 #| vscode: {languageId: julia}
-pruned_trees = [deepcopy(t) for t in rand(trees, 100)]
+pruned_trees = [deepcopy(t) for t in rand(trees, 50)]
 for t in pruned_trees
     droptips!(t, setdiff(getleafnames(t), taxa))
 end
@@ -394,10 +395,92 @@ chains_brownian_regression_recursive = Chains(
     sample_names(pt_brownian_regression_recursive)
 )
 
-chains_brownian_regression_recursive[:, ["alpha", "beta", "urate", "latent_index"], :]
+display(chains_brownian_regression_recursive[:, ["alpha", "beta", "urate", "latent_index"], :])
 
-plot(chains_brownian_regression_recursive[:, ["alpha", "beta", "urate", "latent_index"], :]
+plot(chains_brownian_regression_recursive[:, ["alpha", "beta", "urate", "latent_index"], :])
+
+
+```
+
+
+```{julia}
+
+@model function brownian_correlation_recursive(pruned_trees, taxa)
+    urho ~ Normal(0.0, 1.0)
+    rho := 0.999 * (2 * cdf(Normal(0.0, 1.0), urho) - 1)
+    Sigma := [1.0-1e-4 rho; rho 1.0-1e-4]
+    latent_index ~ Normal(0.0, 1.0)
+    n = length(pruned_trees)
+    tree_index = clamp(Int(ceil(cdf(Normal(0.0, 1.0), latent_index) * n)), 1, n)
+    tree = pruned_trees[tree_index]
+    urates ~ MvNormal(zeros(2), ones(2))
+    rates := exp.(urates)
+
+    root, mothers, daughters, lengths, nodes_dict = decompose_tree(tree)
+    z_std ~ filldist(MvNormal(zeros(2), Sigma), length(mothers))
+    z = zeros(Float64, (2, length(nodes_dict)))
+    mu ~ filldist(Normal(0, 10.0), 2)
+    z[:, nodes_dict[root]] .= mu
+    for i in length(mothers):-1:1
+        dgt = nodes_dict[daughters[i]]
+        mth = nodes_dict[mothers[i]]
+        for k in 1:2
+            z[k, dgt] = z[k, mth] + sqrt(rates[k] * lengths[i]) * z_std[k, i]
+        end
+    end
+    z_tips = hcat([z[:, nodes_dict[l]] for l in taxa]...)
+    x ~ product_distribution(BernoulliLogit.(z_tips[1,:]))
+    y ~ product_distribution(BernoulliLogit.(z_tips[2,:]))
+end
+
+```
+
+
+```{julia}
+
+function brownian_correlation_recursive_target(pruned_trees=pruned_trees, taxa=taxa, x = d.x, y=d.y)
+    return Pigeons.TuringLogPotential(brownian_correlation_recursive(pruned_trees, taxa) | (x = d.x, y=d.y,))
+end
+
+BrownianCorrelationRecursiveType = typeof(brownian_correlation_recursive_target())
+
+function Pigeons.initialization(target::BrownianCorrelationRecursiveType, rng::AbstractRNG, ::Int64)
+    # First run the model to populate all variables
+    result = DynamicPPL.VarInfo(rng, target.model, DynamicPPL.SampleFromPrior(), DynamicPPL.PriorContext())
+
+    # Link the variables to their transformed space
+    result = DynamicPPL.link(result, target.model)
+
+    return result
+end
+
+inputs_brownian_correlation_recursive = Inputs(
+    target=brownian_correlation_recursive_target(),
+    multithreaded=true,
+    record=[traces; record_default()]
 )
+
+
+pt_brownian_correlation_recursive = pigeons(inputs_brownian_correlation_recursive)
+
+```
+
+
+```{julia}
+println(stepping_stone(pt_brownian_correlation_recursive))
+
+```
+
+```{julia}
+
+chains_brownian_correlation_recursive = Chains(
+    sample_array(pt_brownian_correlation_recursive),
+    sample_names(pt_brownian_correlation_recursive)
+)
+
+display(chains_brownian_correlation_recursive[:, ["urho", "urates[1]", "urates[2]", "latent_index"], :])
+
+plot(chains_brownian_correlation_recursive[:, ["urho", "urates[1]", "urates[2]", "latent_index"], :])
 
 
 ```

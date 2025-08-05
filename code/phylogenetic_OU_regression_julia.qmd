@@ -518,7 +518,7 @@ cholesky_matrices = [cholesky(vcv / 100).L for vcv in vcv_matrices] # rescaling 
     n_data = length(x)
     n_trees = length(cholesky_matrices)
     # Center x
-    means_x = mean(x)
+    X_centered = x .- mean(x)
 
     # Priors
     α ~ LocationScale(0, 2.5, TDist(3))
@@ -530,7 +530,7 @@ cholesky_matrices = [cholesky(vcv / 100).L for vcv in vcv_matrices] # rescaling 
     cm = cholesky_matrices[tree_index]
     m = cm * sqrt(rate)
     z_std ~ MvNormal(n_data, 1.0)
-    z = α .+ β .* means_x .+  (m * z_std)
+    z = α .+ β .* X_centered .+  (m * z_std)
     y ~ product_distribution(Bernoulli.(cdf.(Normal(), z)))
     return (α=α, β=β, rate=rate, tree_index=tree_index)
 end
@@ -594,5 +594,61 @@ samples = Chains(Array(df_brownian_regression), names(df_brownian_regression))
 samples[:, [:α, :β, :rate, :tree_index], :] |> display
 
 samples[:, [:α, :β, :rate, :tree_index], :] |> plot
+
+```
+
+
+```{julia}
+
+@model function brownian_marg(vcv_matrices, x, y)
+    n_data = length(x)
+    n_trees = length(vcv_matrices)
+        # Center x
+    X_centered = x .- mean(x)
+
+        # Priors
+    α ~ LocationScale(0, 2.5, TDist(3)) 
+    β ~ Normal(0, 2)
+    u_rate ~ Normal(0, 1)
+    rate := exp(u_rate)
+    latent_index ~ Normal()
+    tree_index := Int(ceil(cdf(Normal(), latent_index) * n_trees))
+    vcv = vcv_matrices[tree_index]
+    eta = α .+ β .* X_centered
+
+    a = [-Inf, 0.][y .+ 1]
+    b = [0.0, Inf][y .+ 1]
+    ll = log(mvnormcdf(eta, vcv, a, b)[1])
+    Turing.@addlogprob! ll
+end
+
+
+```
+
+
+
+```{julia}
+
+function brownian_marg_target(vcv_matrices=vcv_matrices, x=d.x, y=d.y)
+    return Pigeons.TuringLogPotential(brownian_marg(vcv_matrices, x, y))
+end
+
+BrownianMargType = typeof(brownian_marg_target())
+
+function Pigeons.initialization(target::BrownianMargType, rng::AbstractRNG, ::Int64)
+    result = DynamicPPL.VarInfo(rng, target.model, DynamicPPL.SampleFromPrior(), DynamicPPL.PriorContext())
+    result = DynamicPPL.link(result, target.model)
+    Pigeons.update_state!(result, :latent_index, 1, rand(Normal()))
+    return result
+end
+
+inputs_brownian_marg = Inputs(
+    target = brownian_marg_target(),
+    multithreaded = true,
+    record = [traces; record_default()]
+)
+
+
+pt_brownian_marg = pigeons(inputs_brownian_marg)
 
 ```
