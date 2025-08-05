@@ -34,6 +34,7 @@ using ProgressMeter
 using Random
 using LogDensityProblems
 using DynamicPPL
+using Kronecker
 ```
 
 
@@ -98,10 +99,16 @@ end
 
 ```{julia}
 #| vscode: {languageId: julia}
+
+full_taxa = intersect(getleafnames.(trees)...)
+
+
 Random.seed!(1234)  # Set seed for reproducibility
 d = @pipe CSV.File("../data/grambank_vals_pruned.csv") |>
           DataFrame |>
-          _[rand(1:nrow(_), 20), :] |>
+          unique(_, :Language_ID) |>
+          filter(row -> row.Language_ID in full_taxa, _) |>
+          _[randperm(nrow(_))[1:20], :] |>
           sort(_, :Language_ID)
 taxa = d.Language_ID
 ```
@@ -116,6 +123,13 @@ for t in pruned_trees
     droptips!(t, setdiff(getleafnames(t), taxa))
 end
 ```
+
+```{julia}
+taxa = getleafnames(pruned_trees[1])
+
+filter!(row -> row.Language_ID in taxa, d)
+```
+
 
 Let us add a combined character `z` to the data, which is $2x+y-1$. 
 
@@ -168,16 +182,16 @@ function get_P(
     exp(Q * t)
 end
 
-function rates_to_matrix(rates::Vector{Float64})
-    Q = zeros(Float64, 4, 4)
+function rates_to_matrix(rates::Vector{Float64}; nstates=4)
+    Q = zeros(Float64, nstates, nstates)
     counter = 1
-    for i in 1:4, j in 1:4
+    for i in 1:nstates, j in 1:nstates
         if i != j
             Q[i, j] = min(rates[counter], 1e10)
             counter += 1
         end
     end
-    for i in 1:4
+    for i in 1:nstates
         Q[i, i] = -sum(Q[i, :])
     end
     return Q
@@ -210,17 +224,6 @@ function get_ll(
 end
 ```
 
-Let us test whether the likelihood function works correctly.
-
-```{julia}
-@showprogress for _ in 1:10000
-    rates = exp.(rand(Normal(0, 1), 12))
-    Q = rates_to_matrix(rates)
-    tree = rand(pruned_trees)
-    get_ll(tree, Q; taxa=taxa, z=d.z)
-end
-
-```
 
 
 Now we create a Turing model using this likelihood function. The model will have a prior on the rate matrix $Q$ and will use the `get_ll` function to compute the log-likelihood of the data given the tree and the rate matrix.
@@ -228,7 +231,7 @@ Now we create a Turing model using this likelihood function. The model will have
 ```{julia}
 
 
-@model function bayes_model(pruned_trees, taxa, z)
+@model function ctmc_dependent_model(pruned_trees, taxa, z)
     urates ~ filldist(Normal(0.0, 1.0), 12)
     rates = exp.(urates)  # lognormal prior
     Q = rates_to_matrix(rates)
@@ -240,7 +243,9 @@ Now we create a Turing model using this likelihood function. The model will have
     tree = pruned_trees[tree_index]
 
     ll = get_ll(tree, Q; taxa=taxa, z=z)
-    Turing.@addlogprob! ll
+    if DynamicPPL.leafcontext(__context__) !== DynamicPPL.PriorContext()
+        Turing.@addlogprob! ll
+    end
     return vcat(rates, [tree_index])
 end
 
@@ -253,7 +258,7 @@ The main difference from the R/Stan approach is that we can simultaneously sampl
 
 
 ```{julia}
-model = bayes_model(pruned_trees, taxa, d.z)
+model_ctmc_dependent = ctmc_dependent_model(pruned_trees, taxa, d.z)
 
 ```
 
@@ -261,67 +266,88 @@ We can now sample from the model using the Metropolis-Hastings algorithm with MC
 
 ```{julia}
 
-chain = sample(
-    model,
-    MH(),
-    MCMCThreads(),
-    20_000,
-    4,
-    progress=true
+pt_ctmc_dependent = pigeons(
+    target=TuringLogPotential(model_ctmc_dependent),
+    n_chains = 2,
+    multithreaded=true,
+    record=[traces; record_default()]
+)
+println(stepping_stone(pt_ctmc_dependent))
+```
+
+
+```{julia}
+
+chains_ctmc_dependent = Chains(
+    sample_array(pt_ctmc_dependent),
+    sample_names(pt_ctmc_dependent)
 )
 
+display(chains_ctmc_dependent)
+plot(chains_ctmc_dependent)
+
+
+
 ```
 
 
-```{julia}
-struct CTMCdependent
-    trees::Vector{RootedTree}
-    taxa::Vector{String}
-    z::Vector{Int}
-    posterior::Bool
-end
 
-function (ctmc_dependent::CTMCdependent)(pars)
-    ndim = length(pars)
-    ll = logpdf(MvNormal(zeros(ndim), ones(ndim)), pars)
-    if ctmc_dependent.posterior
-        urates = pars[1:(end-1)]
-        rates = exp.(urates)
-        Q = rates_to_matrix(rates)
-        latent_index = pars[end]
-        n = length(ctmc_dependent.trees)
-        tree_index = clamp(Int(ceil(cdf(Normal(0.0, 1.0), latent_index) * n)), 1, n)
-        tree = ctmc_dependent.trees[tree_index]
-        ll += get_ll(tree, Q; taxa=ctmc_dependent.taxa, z=ctmc_dependent.z)
+```{julia}
+
+@model function ctmc_independent_model(pruned_trees, taxa, x, y)
+    urates_x ~ filldist(Normal(0.0, 1.0), 2)
+    rates_x = exp.(urates_x)  # lognormal prior
+    Q_x = rates_to_matrix(rates_x, nstates=2)
+
+    urates_y ~ filldist(Normal(0.0, 1.0), 2)
+    rates_y = exp.(urates_y)  # lognormal prior
+    Q_y = rates_to_matrix(rates_y, nstates=2)
+
+    latent_index ~ Normal(0.0, 1.0)
+    n = length(pruned_trees)
+    tree_index = clamp(Int(ceil(cdf(Normal(0.0, 1.0), latent_index) * n)), 1, n)
+
+    tree = pruned_trees[tree_index]
+
+    ll_x = get_ll(tree, Q_x; taxa=taxa, z=x .+ 1)
+    ll_y = get_ll(tree, Q_y; taxa=taxa, z=y .+ 1)
+    if DynamicPPL.leafcontext(__context__) !== DynamicPPL.PriorContext()
+        Turing.@addlogprob! ll_x
+        Turing.@addlogprob! ll_y
     end
-    return ll
+    return vcat(rates_x, rates_y, [tree_index])
 end
-
-```
-
-
-```{julia}
-ctmc_dependent = CTMCdependent(pruned_trees, taxa, d.z, true)
-
-ctmc_dependent(zeros(13))
-
 ```
 
 ```{julia}
+model_ctmc_independent = ctmc_independent_model(pruned_trees, taxa, d.x, d.y)
 
-Pigeons.initialization(::CTMCdependent, ::AbstractRNG, ::Int) = zeros(13)
-pt = pigeons(
-    target=CTMCdependent(pruned_trees, taxa, d.z, true),
-    reference=CTMCdependent(pruned_trees, taxa, d.z, false),
+pt_ctmc_independent = pigeons(
+    target=TuringLogPotential(model_ctmc_independent),
+    n_chains = 2,
     multithreaded=true,
     record=[traces; record_default()]
 )
 
+println(stepping_stone(pt_ctmc_independent))
+
 ```
 
+
 ```{julia}
-stepping_stone(pt)
+
+chains_ctmc_independent = Chains(
+    sample_array(pt_ctmc_independent),
+    sample_names(pt_ctmc_independent)
+)
+
+display(chains_ctmc_independent)
+plot(chains_ctmc_independent)
+
+
+
 ```
+
 
 ```{julia}
 
@@ -373,6 +399,7 @@ end
 
 inputs_brownian_regression_recursive = Inputs(
     target=brownian_regression_recursive_target(),
+    n_chains = 4,
     multithreaded=true,
     record=[traces; record_default()]
 )
@@ -380,10 +407,7 @@ inputs_brownian_regression_recursive = Inputs(
 
 pt_brownian_regression_recursive = pigeons(inputs_brownian_regression_recursive)
 
-```
 
-
-```{julia}
 println(stepping_stone(pt_brownian_regression_recursive))
 
 ```
@@ -408,7 +432,7 @@ plot(chains_brownian_regression_recursive[:, ["alpha", "beta", "urate", "latent_
 @model function brownian_correlation_recursive(pruned_trees, taxa)
     urho ~ Normal(0.0, 1.0)
     rho := 0.999 * (2 * cdf(Normal(0.0, 1.0), urho) - 1)
-    Sigma := [1.0-1e-4 rho; rho 1.0-1e-4]
+    Sigma := [1.0 rho; rho 1.0]
     latent_index ~ Normal(0.0, 1.0)
     n = length(pruned_trees)
     tree_index = clamp(Int(ceil(cdf(Normal(0.0, 1.0), latent_index) * n)), 1, n)
@@ -456,6 +480,7 @@ end
 
 inputs_brownian_correlation_recursive = Inputs(
     target=brownian_correlation_recursive_target(),
+    n_chains = 5,
     multithreaded=true,
     record=[traces; record_default()]
 )
@@ -463,10 +488,7 @@ inputs_brownian_correlation_recursive = Inputs(
 
 pt_brownian_correlation_recursive = pigeons(inputs_brownian_correlation_recursive)
 
-```
 
-
-```{julia}
 println(stepping_stone(pt_brownian_correlation_recursive))
 
 ```
@@ -485,5 +507,115 @@ plot(chains_brownian_correlation_recursive[:, ["urho", "urates[1]", "urates[2]",
 
 ```
 
+
+
 ```{julia}
+
+function get_vcv(tree; taxa=taxa)
+    root = getroot(tree)
+    tips = getleaves(tree)
+    tip_names = getleafnames(tree)
+    vcv = zeros(length(tips), length(tips))
+
+    # Compute VCV matrix (upper triangle only)
+    for i in 1:length(tips)
+        for j in i:length(tips)
+            if i == j
+                # Diagonal: total distance from root to tip (variance)
+                vcv[i, j] = distance(tree, root, tips[i])
+            else
+                # Off-diagonal: shared evolutionary time (distance from root to MRCA)
+                vcv[j, i] = vcv[i, j] = distance(tree, root, mrca(tree, [tips[i], tips[j]]))
+            end
+        end
+    end
+    return vcv[indexin(tip_names, taxa), indexin(tip_names, taxa)]
+end
+
 ```
+
+```{julia}
+
+vcv_matrices = [get_vcv(t, taxa=taxa) for t in pruned_trees]
+
+cholesky_matrices = [cholesky(vcv).L for vcv in vcv_matrices] 
+
+```
+
+
+
+```{julia}
+@model function brownian_correlation_kronecker(cholesky_matrices)
+    urho ~ Normal(0.0, 1.0)
+    rho := 0.999 * (2 * cdf(Normal(0.0, 1.0), urho) - 1)
+    Sigma_l = [1.0 0; rho sqrt(1.0-rho^2)]
+    latent_index ~ Normal(0.0, 1.0)
+    n = length(pruned_trees)
+    tree_index = clamp(Int(ceil(cdf(Normal(0.0, 1.0), latent_index) * n)), 1, n)
+    m = cholesky_matrices[tree_index]
+    urates ~ MvNormal(zeros(2), ones(2))
+    rates = exp.(urates)
+
+    product_matrix = Matrix(m ⊗ Sigma_l)
+
+    mu ~ filldist(Normal(0, 10.0), 2)
+    z_std ~ filldist(Normal(), size(product_matrix, 1))
+    z = reshape(product_matrix * z_std, 2, :) .+ mu
+    x ~ product_distribution(BernoulliLogit.(rates[1]^2 .* z[1,:]))
+    y ~ product_distribution(BernoulliLogit.(rates[2]^2 .* z[2,:]))
+end
+
+
+
+```
+
+
+
+```{julia}
+
+function brownian_correlation_kronecker_target(vcv_matrices=vcv_matrices, x=d.x, y=d.y)
+    return Pigeons.TuringLogPotential(brownian_correlation_kronecker(vcv_matrices) | (x = d.x, y=d.y,))
+end
+
+BrownianCorrelationKroneckerType = typeof(brownian_correlation_kronecker_target())
+
+function Pigeons.initialization(target::BrownianCorrelationRecursiveType, rng::AbstractRNG, ::Int64)
+    # First run the model to populate all variables
+    result = DynamicPPL.VarInfo(rng, target.model, DynamicPPL.SampleFromPrior(), DynamicPPL.PriorContext())
+
+    # Link the variables to their transformed space
+    result = DynamicPPL.link(result, target.model)
+
+    return result
+end
+
+inputs_brownian_correlation_kronecker = Inputs(
+    target=brownian_correlation_kronecker_target(),
+    n_chains = 5,
+    multithreaded=true,
+    record=[traces; record_default()]
+)
+
+
+pt_brownian_correlation_kronecker = pigeons(inputs_brownian_correlation_kronecker)
+
+
+println(stepping_stone(pt_brownian_correlation_kronecker))
+
+```
+
+
+```{julia}
+
+chains_brownian_correlation_kronecker = Chains(
+    sample_array(pt_brownian_correlation_kronecker),
+    sample_names(pt_brownian_correlation_kronecker)
+)
+
+display(chains_brownian_correlation_kronecker[:, ["urho", "urates[1]", "urates[2]", "latent_index"], :])
+
+plot(chains_brownian_correlation_kronecker[:, ["urho", "urates[1]", "urates[2]", "latent_index"], :])
+
+
+```
+
