@@ -42,6 +42,7 @@ using Optim
 using Phylo
 using Pipe
 using Pigeons
+using PlotlyJS
 using Printf
 using ProgressMeter
 using Random
@@ -54,6 +55,7 @@ using Tar
 using TransformVariables
 using Main.Threads
 using Turing
+plotlyjs()
 ```
 
 ## Data
@@ -135,166 +137,8 @@ for t in pruned_trees
 end
 ```
 
-################################
-## Vanilla regression
+Here is a little helperfunction to be used later:
 
-We will use the same model as in the previous notebook, but now we will use Turing.jl to implement it.
-
-The likelihood is implemented as a Turing model like this:
-
-```{julia}
-#| vscode: {languageId: julia}
-@model function vanilla_regression(; x=d.x)
-    N = length(x)
-    # Center x
-    means_x = mean(x)
-    Xc = x .- means_x
-
-    # Priors
-    alpha ~ LocationScale(0, 2.5, TDist(3))
-    beta ~ Normal(0, 2)
-
-    # Linear predictor
-    η = alpha .+ beta .* Xc
-
-    y ~ product_distribution(Bernoulli.(cdf.(Normal(), η)))
-    # Likelihood
-
-    loglik := [logpdf(Bernoulli(cdf(Normal(), η[i])), y[i]) for i in 1:N]
-    y_rep := [rand(Bernoulli(cdf(Normal(), η[i]))) for i in 1:N]
-    return (y=y, loglik=loglik, y_rep=y_rep)
-end
-```
-
-
-
-
-Let's run the model:
-
-```{julia}
-#| vscode: {languageId: julia}
-
-model_vanilla_regression = vanilla_regression() | (y=d.y,)
-
-# Run the model
-
-chain_vanilla_regression = sample(
-    model_vanilla_regression,
-    NUTS(),
-    MCMCThreads(),
-    1000,
-    4,
-    discard_initial=1000,
-    progress=true,
-)
-
-# Print summary of the chain
-describe(chain_vanilla_regression[:, [:alpha, :beta], :])
-```
-
-The 95% credible intervals for the parameters are:
-
-```{julia}
-#| vscode: {languageId: julia}
-
-hpd(chain_vanilla_regression[:, [:alpha, :beta], :])
-```
-
-
-```{julia}
-#| vscode: {languageId: julia}
-# plot the posterior distributions of alpha and beta
-
-ridgelineplot(chain_vanilla_regression, [:beta], title="Posterior distributions of beta")
-
-```
-
-This looks reassuringly similar to the R/Stan model. Now let's plot the prior and posterior predictive distributions.
-
-```{julia}
-
-function predictive_checks_regression(y_rep, y_prior; d=d)
-    obs_0 = mean(d.y[d.x.==0])
-    obs_1 = mean(d.y[d.x.==1])
-    # Define colors
-    CBblue = RGB(0.0, 114 / 255, 178 / 255)
-    CBvermillion = RGB(213 / 255, 94 / 255, 0.0)
-
-    p0 = density(y_prior[d.x.==0],
-        fill=(0, 0.5, CBblue),
-        label="Prior",
-        title="P(y=1|x=0)"
-    )
-    density!(p0, y_rep[d.x.==0],
-        fill=(0, 0.5, CBvermillion),
-        label="Posterior")
-    vline!(p0, [obs_0], color=:black, label="", linewidth=2)
-
-
-    p1 = density(y_prior[d.x.==1],
-        fill=(0, 0.5, CBblue),
-        label=false,
-        title="P(y=1|x=1)"
-    )
-    density!(p1, y_rep[d.x.==1],
-        fill=(0, 0.5, CBvermillion),
-        label=false
-    )
-    vline!(p1, [obs_1], color=:black, label="", linewidth=2)
-
-
-    link = :both
-    plot(p0, p1, layout=(2, 1), link=:x, legend=:topleft)
-end
-
-```
-
-Next we sample from the prior and the posterior. In Turing, this is fairly straightforward.
-
-```{julia}
-# Prior predictive sampling - sample from prior with missing y
-prior_chain = sample(vanilla_regression(), Prior(), 4000)
-
-# Posterior predictive sampling - use the fitted chain
-
-y_rep_names = [v for v in names(prior_chain) if occursin("y_rep", string(v))]
-
-y_prior = mean(Array(prior_chain[:, y_rep_names, :]), dims=1) |> vec
-
-y_rep = mean(Array(chain_vanilla_regression[:, y_rep_names, :]), dims=1) |> vec
-```
-
-```{julia}
-predictive_checks_regression(y_rep, y_prior)
-```
-
-Next we compute the marginal log-likelihood and the LOOIC.
-
-```{julia}
-vanilla_regression_target = TuringLogPotential(vanilla_regression() | (y=d.y,))
-pt_vanilla_regression = pigeons(target=vanilla_regression_target, multithreaded=true)
-println(stepping_stone(pt_vanilla_regression))
-
-```
-
-
-
-```{julia}
-
-loglik_names = [v for v in names(chain_vanilla_regression) if occursin("loglik", string(v))]
-
-loglik_vanilla = Array(chain_vanilla_regression[:, loglik_names, :])
-
-#| vscode: {languageId: julia}
-# Compute LOOIC
-loo_vanilla_regression = convert(
-    Dict,
-    R"
-    library(loo)
-    loo($(loglik_vanilla))
-    ",
-);
-```
 
 ```{julia}
 #| vscode: {languageId: julia}
@@ -316,95 +160,73 @@ end
 
 ```
 
-```{julia}
-# Print LOO results
-println("LOO Results:")
-loo_results_vanilla_regression = format_loo_results(loo_vanilla_regression)
-println(loo_results_vanilla_regression)
-```
+In this notebook, I will focus on the correlation models, where both variables are modeled as stochastic. We start with the vanilla correlation model, which does not use phylogenetic information.
+
+First we implement the model in Turing.jl. The model is a simple multivariate logistic regression with a correlation structure.
 
 ```{julia}
 #| vscode: {languageId: julia}
 
 @model function vanilla_correlation(N)
+    
     # Priors
     mu ~ filldist(Normal(0, 2.5), 2)
-    rhostar ~ Logistic(0, 1)
-    rho := 0.95 * (2 * logistic(rhostar) - 1)  # Keep rho in (-0.95, 0.95)
-
+    rho ~ Uniform(-0.95, 0.95)  # Correlation coefficient in (-0.95, 0.95)
+    
     # Add small regularization for numerical stability
     eps = 1e-6
     Sigma = [
         1.0+eps rho
         rho 1.0+eps
     ]
-
-
-    p1 = mvnormcdf(mu, Sigma, [-Inf, -Inf], [0.0, 0.0])[1]
-    p2 = mvnormcdf(mu, Sigma, [-Inf, 0.0], [0.0, Inf])[1]
-    p3 = mvnormcdf(mu, Sigma, [0.0, -Inf], [Inf, 0.0])[1]
-    p4 = mvnormcdf(mu, Sigma, [0.0, 0.0], [Inf, Inf])[1]
-
-    # Ensure all probabilities are positive and sum to something reasonable
-    p_raw = [p1, p2, p3, p4]
-    p_clean = max.(p_raw, eps)  # Ensure minimum probability
-    p_norm = p_clean ./ sum(p_clean)  # Normalize
-
-    xy ~ filldist(Categorical(p_norm), N)
-
-    p_x0 = [p_norm[1], p_norm[2]] / sum([p_norm[1], p_norm[2]])
-    p_x1 = [p_norm[3], p_norm[4]] / sum([p_norm[3], p_norm[4]])
-
-
-    x := Int.(xy .> 2)
-    y := Int.((xy .== 2) .| (xy .== 4))
-    p_y = [p_x0, p_x1][x.+1]
-
-    y_rep := [rand(Bernoulli(p_y[i][2])) for i in 1:N]
-    loglik := [logpdf(Bernoulli(p_y[i][2]), y[i]) for i in 1:N]
-
-    mu1 := mu[1]
-    mu2 := mu[2]
-    return (mu1=mu1, mu2=mu2, rho=rho, y_rep=y_rep, loglik=loglik)
+    z ~ filldist(MvNormal(mu, Sigma), N)
+    x ~ product_distribution(BernoulliLogit.(z[1,:]))
+    y ~ product_distribution(BernoulliLogit.(z[2,:]))
 end
 
 
 ```
 
+In this notebook, I will use the `Pigeons` package to fit the model. Pigeons is a Julia package implementing *parallel tempering* sampling. It is based on Slice sampling, i.e., a sampling method not using automatic differentiation. This makes it possible to include discrete variables alongside continuous ones, which is useful handling phylogenetic uncertainty.
+
+Parallel tempering is comparatively slow. I still chose it because it computes both the posterior and the marginal likelihood in one swoop. 
+
+
 ```{julia}
-#| vscode: {languageId: julia}
 
-xy = 2 * d.x .+ d.y .+ 1
 
-# Recreate the model instance with the updated function
-model_vanilla_correlation = vanilla_correlation(length(d.x)) | (xy=xy,)
-
-chain_vanilla_correlation = Turing.sample(
-    model_vanilla_correlation,
-    NUTS(),
-    MCMCThreads(),
-    200,
-    4,
-    discard_initial=100,
-    progress=true,
+inputs_vanilla_correlation = Inputs(
+    target=TuringLogPotential(vanilla_correlation(nrow(d)) | (x=d.x, y=d.y)),
+    n_chains = 2,
+    multithreaded=true,
+    record = [traces; record_default()]
 )
 
-# Print summary of the chain
-display(
-    chain_vanilla_correlation[:, [:mu1, :mu2, :rho], :]
-)
+pt_vanilla_correlation = pigeons(inputs_vanilla_correlation)
 
-plot(
-    chain_vanilla_correlation[:, [:mu1, :mu2, :rho], :]
-)
+println(stepping_stone(pt_vanilla_correlation))
 
 
 ```
 
 ```{julia}
+
+chain_vanilla_correlation = Chains(sample_array(pt_vanilla_correlation), sample_names(pt_vanilla_correlation))
+
+nms = [nm for nm in sample_names(pt_vanilla_correlation) if !occursin("z", string(nm)) && !occursin("loglik", string(nm)) && !occursin("y_rep", string(nm)) && !occursin("x_rep", string(nm))]
+
+display(chain_vanilla_correlation[:, nms, :])
+
+plot(chain_vanilla_correlation[:, nms, :])
+
+```
+
+
+
+```{julia}
 #| vscode: {languageId: julia}
 
-hpd(chain_vanilla_correlation[:, [:mu1, :mu2, :rho], :])
+hpd(chain_vanilla_correlation[:, ["mu[1]", "mu[2]", "rho"], :])
 ```
 
 ```{julia}
@@ -417,22 +239,6 @@ ridgelineplot(chain_vanilla_correlation, [:rho], title="Posterior distributions 
 
 # Prior and posterior predictive sampling for vanilla_correlation
 
-Computing the marginal log-likelihood and LOOIC for the correlation model:
-
-```{julia}
-# Create target for the correlation model
-target = TuringLogPotential(vanilla_correlation(nrow(d)) | (xy=xy,))
-
-
-pt_vanilla_correlation = pigeons(
-    target=target,
-    multithreaded=true,
-)
-
-println(stepping_stone(pt_vanilla_correlation))
-```
-
-
 
 ```{julia}
 # Prior predictive sampling 
@@ -440,26 +246,43 @@ prior_chain = Turing.sample(vanilla_correlation(nrow(d)), Prior(), 4000)
 
 # Posterior predictive sampling - use the fitted chain
 
-y_rep_names = [v for v in names(prior_chain) if occursin("y_rep", string(v))]
+x_rep_names = [v for v in names(prior_chain) if occursin("x", string(v))]
 
-y_prior = mean(Array(prior_chain[:, y_rep_names, :]), dims=1) |> vec
+y_rep_names = [v for v in names(prior_chain) if occursin("y", string(v))]
 
-y_rep = mean(Array(chain_vanilla_correlation[:, y_rep_names, :]), dims=1) |> vec;
+x_prior = Int.(Array(prior_chain[:, x_rep_names, :]))
+
+y_prior = Int.(Array(prior_chain[:, y_rep_names, :]))
+
+x_posterior = hcat([rand(product_distribution(BernoulliLogit.(chain_vanilla_correlation[:,"z[$(2*i-1)]", :]))) for i in 1:100]...)
+
+y_posterior = hcat([rand(product_distribution(BernoulliLogit.(chain_vanilla_correlation[:,"z[$(2*i)]", :]))) for i in 1:100]...)
+
+prior_cors = [cor(x_prior[i, :], y_prior[i, :]) for i in 1:size(x_prior, 1)]
+# Remove NaNs from prior_cors
+prior_cors = filter(!isnan, prior_cors)
+
+posterior_cors = [cor(x_posterior[i, :], y_posterior[i, :]) for i in 1:size(x_posterior, 1)]
+# Remove NaNs from posterior_cors
+posterior_cors = filter(!isnan, posterior_cors)
+
+df = DataFrame(
+    cor = vcat(prior_cors, posterior_cors),
+    type = vcat(fill("prior", length(prior_cors)), fill("posterior", length(posterior_cors)))
+)
+
+@df df density(:cor, group=:type, title="Prior and Posterior Correlation Distributions", xlabel="Correlation", ylabel="Density")
+vline!([cor(d.x, d.y)])
+
 ```
 
 
 
-```{julia}
-predictive_checks_regression(y_rep, y_prior)
-```
-
-
 
 ```{julia}
 
-loglik_names = [v for v in names(chain_vanilla_correlation) if occursin("loglik", string(v))]
+loglik_vanilla_correlation = hcat([logpdf.(BernoulliLogit.(chain_vanilla_correlation[:,"z[$(2*i-1)]", :]), d.x[i]) .+ logpdf.(BernoulliLogit.(chain_vanilla_correlation[:,"z[$(2*i)]", :]), d.y[i]) for i in 1:nrow(d)]...)
 
-loglik_vanilla = Array(chain_vanilla_correlation[:, loglik_names, :])
 
 #| vscode: {languageId: julia}
 # Compute LOOIC
@@ -467,7 +290,7 @@ loo_vanilla_correlation = convert(
     Dict,
     R"
     library(loo)
-    loo($(loglik_vanilla))
+    loo($(loglik_vanilla_correlation))
     ",
 );
 ```
