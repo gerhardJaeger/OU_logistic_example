@@ -174,7 +174,9 @@ function decompose_tree(
     (root=root, mothers=mothers, daughters=daughters, lengths=lengths, nodes_dict=nodes_dict)
 end
 
+```
 
+```{julia}
 function get_P(
     t::Float64,
     Q::AbstractMatrix{Float64},
@@ -430,15 +432,13 @@ plot(chains_brownian_regression_recursive[:, ["alpha", "beta", "urate", "latent_
 ```{julia}
 
 @model function brownian_correlation_recursive(pruned_trees, taxa)
-    urho ~ Normal(0.0, 1.0)
-    rho := 0.999 * (2 * cdf(Normal(0.0, 1.0), urho) - 1)
+    rho ~ Uniform(-0.999, 0.999)
     Sigma := [1.0 rho; rho 1.0]
-    latent_index ~ Normal(0.0, 1.0)
     n = length(pruned_trees)
-    tree_index = clamp(Int(ceil(cdf(Normal(0.0, 1.0), latent_index) * n)), 1, n)
+    latent_index ~ Uniform(0, n)
+    tree_index = clamp(Int(ceil(latent_index)), 1, n)
     tree = pruned_trees[tree_index]
-    urates ~ MvNormal(zeros(2), ones(2))
-    rates := exp.(urates)
+    rates ~ filldist(LogNormal(0.0, 1.0), 2)
 
     root, mothers, daughters, lengths, nodes_dict = decompose_tree(tree)
     z_std ~ filldist(MvNormal(zeros(2), Sigma), length(mothers))
@@ -500,9 +500,9 @@ chains_brownian_correlation_recursive = Chains(
     sample_names(pt_brownian_correlation_recursive)
 )
 
-display(chains_brownian_correlation_recursive[:, ["urho", "urates[1]", "urates[2]", "latent_index"], :])
+display(chains_brownian_correlation_recursive[:, ["rho", "rates[1]", "rates[2]", "latent_index"], :])
 
-plot(chains_brownian_correlation_recursive[:, ["urho", "urates[1]", "urates[2]", "latent_index"], :])
+plot(chains_brownian_correlation_recursive[:, ["rho", "rates[1]", "rates[2]", "latent_index"], :])
 
 
 ```
@@ -546,15 +546,13 @@ cholesky_matrices = [cholesky(vcv).L for vcv in vcv_matrices]
 
 ```{julia}
 @model function brownian_correlation_kronecker(cholesky_matrices)
-    urho ~ Normal(0.0, 1.0)
-    rho := 0.999 * (2 * cdf(Normal(0.0, 1.0), urho) - 1)
+    rho ~ Uniform(-0.999, 0.999)
     Sigma_l = [1.0 0; rho sqrt(1.0-rho^2)]
-    latent_index ~ Normal(0.0, 1.0)
     n = length(pruned_trees)
-    tree_index = clamp(Int(ceil(cdf(Normal(0.0, 1.0), latent_index) * n)), 1, n)
+    latent_index ~ Uniform(0, n)
+    tree_index = clamp(Int(ceil(latent_index)), 1, n)
     m = cholesky_matrices[tree_index]
-    urates ~ MvNormal(zeros(2), ones(2))
-    rates = exp.(urates)
+    rates ~ filldist(LogNormal(0.0, 1.0), 2)
 
     product_matrix = Matrix(m ⊗ Sigma_l)
 
@@ -563,6 +561,7 @@ cholesky_matrices = [cholesky(vcv).L for vcv in vcv_matrices]
     z = reshape(product_matrix * z_std, 2, :) .+ mu
     x ~ product_distribution(BernoulliLogit.(rates[1]^2 .* z[1,:]))
     y ~ product_distribution(BernoulliLogit.(rates[2]^2 .* z[2,:]))
+    return (tree_index = tree_index,)
 end
 
 
@@ -612,10 +611,105 @@ chains_brownian_correlation_kronecker = Chains(
     sample_names(pt_brownian_correlation_kronecker)
 )
 
-display(chains_brownian_correlation_kronecker[:, ["urho", "urates[1]", "urates[2]", "latent_index"], :])
+display(chains_brownian_correlation_kronecker[:, ["rho", "rates[1]", "rates[2]", "latent_index"], :])
 
-plot(chains_brownian_correlation_kronecker[:, ["urho", "urates[1]", "urates[2]", "latent_index"], :])
+plot(chains_brownian_correlation_kronecker[:, ["rho", "rates[1]", "rates[2]", "latent_index"], :])
 
 
 ```
 
+############
+
+
+
+```{julia}
+
+@model function OU_correlation_recursive(pruned_trees, taxa)
+    rho ~ Uniform(-0.999, 0.999)
+    sigma ~ LogNormal(0.0, 1.0)
+    mu ~ filldist(Normal(0, 2.0), 2)
+    lambda ~ filldist(LogNormal(0.0, 1.0), 2)
+
+    Sigma = [1.0 rho; rho 1.0]
+    L_std = cholesky(Sigma).L
+    n = length(pruned_trees)
+    latent_index ~ Uniform(0, n)
+    tree_index = clamp(Int(ceil(latent_index)), 1, n)
+    tree = pruned_trees[tree_index]
+
+    root, mothers, daughters, lengths, nodes_dict = decompose_tree(tree)
+    z_std ~ filldist(MvNormal(zeros(2), ones(2)), length(nodes_dict))
+    z = zeros(Float64, (2, length(nodes_dict)))
+    z[:, nodes_dict[root]] .= mu .+ (sigma ./ sqrt.(2 .* lambda)) .* (L_std * z_std[:, nodes_dict[root]])
+    for i in length(mothers):-1:1
+        dgt = nodes_dict[daughters[i]]
+        mth = nodes_dict[mothers[i]]
+        decay = exp.(-lambda * lengths[i])
+        s = sigma .* sqrt.(-expm1.(-2 * lambda * lengths[i]) ./ (2 * lambda))
+        mn = mu .+ (z[:,mth] - mu) .* decay
+        eps = L_std * z_std[:,dgt]
+        z[:,dgt] = (mn .+ s .* eps)
+    end
+    z_tips = hcat([z[:, nodes_dict[l]] for l in taxa]...)
+    x ~ product_distribution(BernoulliLogit.(z_tips[1,:]))
+    y ~ product_distribution(BernoulliLogit.(z_tips[2,:]))
+end
+
+```
+
+
+```{julia}
+
+function OU_correlation_recursive_target(pruned_trees=pruned_trees, taxa=taxa, x = d.x, y=d.y)
+    return Pigeons.TuringLogPotential(OU_correlation_recursive(pruned_trees, taxa) | (x = d.x, y=d.y,))
+end
+
+OUCorrelationRecursiveType = typeof(OU_correlation_recursive_target())
+
+function Pigeons.initialization(target::OUCorrelationRecursiveType, rng::AbstractRNG, ::Int64)
+    # First run the model to populate all variables
+    result = DynamicPPL.VarInfo(rng, target.model, DynamicPPL.SampleFromPrior(), DynamicPPL.PriorContext())
+
+    # Link the variables to their transformed space
+    result = DynamicPPL.link(result, target.model)
+
+    return result
+end
+
+inputs_OU_correlation_recursive = Inputs(
+    target=OU_correlation_recursive_target(),
+    n_chains = 5,
+    multithreaded=true,
+    record=[traces; record_default()]
+)
+
+
+pt_OU_correlation_recursive = pigeons(inputs_OU_correlation_recursive)
+
+
+println(stepping_stone(pt_OU_correlation_recursive))
+
+```
+
+```{julia}
+
+chains_OU_correlation_recursive = Chains(
+    sample_array(pt_OU_correlation_recursive),
+    sample_names(pt_OU_correlation_recursive)
+)
+
+display_names = [nm for nm in sample_names(pt_OU_correlation_recursive) if !occursin("z", String(nm))]
+
+
+display(chains_OU_correlation_recursive[:, display_names, :])
+
+plot(chains_OU_correlation_recursive[:, display_names, :])
+
+
+```
+
+
+
+
+```{julia}
+```
