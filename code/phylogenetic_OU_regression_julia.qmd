@@ -42,7 +42,6 @@ using Optim
 using Phylo
 using Pipe
 using Pigeons
-using PlotlyJS
 using Printf
 using ProgressMeter
 using Random
@@ -55,7 +54,7 @@ using Tar
 using TransformVariables
 using Main.Threads
 using Turing
-plotlyjs()
+plotly()
 ```
 
 ## Data
@@ -232,7 +231,7 @@ hpd(chain_vanilla_correlation[:, ["mu[1]", "mu[2]", "rho"], :])
 ```{julia}
 #| vscode: {languageId: julia}
 # plot the posterior distributions of alpha and beta
-
+gr()
 ridgelineplot(chain_vanilla_correlation, [:rho], title="Posterior distributions of ρ")
 
 ```
@@ -242,7 +241,7 @@ ridgelineplot(chain_vanilla_correlation, [:rho], title="Posterior distributions 
 
 ```{julia}
 # Prior predictive sampling 
-prior_chain = Turing.sample(vanilla_correlation(nrow(d)), Prior(), 4000)
+prior_chain = Turing.sample(vanilla_correlation(nrow(d)), Prior(), length(chain_vanilla_correlation))
 
 # Posterior predictive sampling - use the fitted chain
 
@@ -254,7 +253,7 @@ x_prior = Int.(Array(prior_chain[:, x_rep_names, :]))
 
 y_prior = Int.(Array(prior_chain[:, y_rep_names, :]))
 
-x_posterior = hcat([rand(product_distribution(BernoulliLogit.(chain_vanilla_correlation[:,"z[$(2*i-1)]", :]))) for i in 1:100]...)
+x_posterior = hcat([rand(product_distribution(BernoulliLogit.(chain_vanilla_correlation[:,"z[$(2*i-1)]", :]))) for i in 1:nrow(d)]...)
 
 y_posterior = hcat([rand(product_distribution(BernoulliLogit.(chain_vanilla_correlation[:,"z[$(2*i)]", :]))) for i in 1:100]...)
 
@@ -301,177 +300,84 @@ loo_results_vanilla_correlation = format_loo_results(loo_vanilla_correlation)
 println(loo_results_vanilla_correlation)
 ```
 
+Now let's move to phylogenetic control. Here is a helper function that converts a tree to a structure similar to `ape`'s phylo object.
 
 ```{julia}
 
-function get_vcv(tree; taxa=taxa)
-    root = getroot(tree)
-    tips = getleaves(tree)
-    tip_names = getleafnames(tree)
-    vcv = zeros(length(tips), length(tips))
-
-    # Compute VCV matrix (upper triangle only)
-    for i in 1:length(tips)
-        for j in i:length(tips)
-            if i == j
-                # Diagonal: total distance from root to tip (variance)
-                vcv[i, j] = distance(tree, root, tips[i])
-            else
-                # Off-diagonal: shared evolutionary time (distance from root to MRCA)
-                vcv[j, i] = vcv[i, j] = distance(tree, root, mrca(tree, [tips[i], tips[j]]))
-            end
+function decompose_tree(
+    tree::RootedTree
+)::@NamedTuple{root::String, mothers::Vector{String}, daughters::Vector{String}, lengths::Vector{Float64}, nodes_dict::Dict{String,Int64}}
+    root = getroot(tree).name
+    mothers = String[]
+    daughters = String[]
+    lengths = Float64[]
+    for nd in traversal(tree, postorder)
+        if !isroot(tree, nd)
+            mother = getparent(tree, nd)
+            br = getinbound(tree, nd)
+            bl = getlength(tree, br)
+            push!(mothers, mother.name)
+            push!(daughters, nd.name)
+            push!(lengths, bl)
         end
     end
-    return vcv[indexin(tip_names, taxa), indexin(tip_names, taxa)]
+
+    nodes = sort!(unique(vcat(mothers, daughters)))
+    nodes_dict = Dict{String,Int}(nodes .=> 1:length(nodes))
+    (root=root, mothers=mothers, daughters=daughters, lengths=lengths, nodes_dict=nodes_dict)
 end
 
 ```
 
-```{julia}
+And now the model for logistic correlation with a Brownian motion phylogenetic structure.
 
-vcv_matrices = [get_vcv(t, taxa=taxa) for t in pruned_trees]
-
-cholesky_matrices = [cholesky(vcv / 100).L for vcv in vcv_matrices] # rescaling tree heights
-
-```
-
-
-```{julia}
-@model function brownian_regression(cholesky_matrices, x)
-    n_data = length(x)
-    n_trees = length(cholesky_matrices)
-    # Center x
-    X_centered = x .- mean(x)
-
-    # Priors
-    α ~ LocationScale(0, 2.5, TDist(3))
-    β ~ Normal(0, 2)
-    u_rate ~ Normal(0, 1)
-    rate := exp(u_rate)
-    latent_index ~ Normal()
-    tree_index := Int(ceil(cdf(Normal(), latent_index) * n_trees))
-    cm = cholesky_matrices[tree_index]
-    m = cm * sqrt(rate)
-    z_std ~ MvNormal(n_data, 1.0)
-    z = α .+ β .* X_centered .+  (m * z_std)
-    y ~ product_distribution(Bernoulli.(cdf.(Normal(), z)))
-    return (α=α, β=β, rate=rate, tree_index=tree_index)
-end
-
-```
+Here I define a continuous variable `latent_index` that is sampled from a uniform distribution between 0 and the number of trees. This variable is mapped to an integer via the ceiling function and then used to select a tree from the set of pruned trees. The `clamp` function ensures that the index is within the valid range of tree indices.
 
 ```{julia}
 
-function brownian_regression_target_fn(cholesky_matrices = cholesky_matrices, x = d.x, y = d.y)
-    return Pigeons.TuringLogPotential(brownian_regression(cholesky_matrices, x) | (y=y,))
-end
+@model function brownian_correlation(pruned_trees, taxa)
+    rho ~ Uniform(-0.999, 0.999)
+    Sigma = [1.0 rho; rho 1.0]
+    n = length(pruned_trees)
+    latent_index ~ Uniform(0, n)
+    tree_index = clamp(Int(ceil(latent_index)), 1, n)
+    tree = pruned_trees[tree_index]
+    rates ~ filldist(LogNormal(0.0, 1.0), 2)
 
-BrownianRegressionType = typeof(brownian_regression_target_fn())
-
-function Pigeons.initialization(target::BrownianRegressionType, rng::AbstractRNG, ::Int64)
-    result = DynamicPPL.VarInfo(rng, target.model, DynamicPPL.SampleFromPrior(), DynamicPPL.PriorContext())
-    result = DynamicPPL.link(result, target.model)
-    Pigeons.update_state!(result, :latent_index, 1, rand(Normal()))
-    for i in 1:length(d.x)
-        Pigeons.update_state!(result, :z_std, i, 0.0)
+    root, mothers, daughters, lengths, nodes_dict = decompose_tree(tree)
+    z_std ~ filldist(MvNormal(zeros(2), Sigma), length(mothers))
+    z = zeros(Float64, (2, length(nodes_dict)))
+    mu ~ filldist(Normal(0, 10.0), 2)
+    z[:, nodes_dict[root]] .= mu
+    for i in length(mothers):-1:1
+        dgt = nodes_dict[daughters[i]]
+        mth = nodes_dict[mothers[i]]
+        for k in 1:2
+            z[k, dgt] = z[k, mth] + sqrt(rates[k] * lengths[i]) * z_std[k, i]
+        end
     end
-    return result
+    z_tips = hcat([z[:, nodes_dict[l]] for l in taxa]...)
+    x ~ product_distribution(BernoulliLogit.(z_tips[1,:]))
+    y ~ product_distribution(BernoulliLogit.(z_tips[2,:]))
 end
 
-inputs_brownian_regression = Inputs(
-    target = brownian_regression_target_fn(),
-    multithreaded = true,
+```
+
+
+```{julia}
+
+
+
+inputs_brownian_correlation = Inputs(
+    target=TuringLogPotential(brownian_correlation(pruned_trees, taxa) | (x=d.x, y=d.y)),
+    n_chains = 2,
+    multithreaded=true,
     record = [traces; record_default()]
 )
 
+pt_brownian_correlation = pigeons(inputs_brownian_correlation)
 
-pt_brownian_regression = pigeons(inputs_brownian_regression)
+println(stepping_stone(pt_brownian_correlation))
 
-```
-
-
-```{julia}
-
-println(stepping_stone(pt_brownian_regression))
-
-```
-
-
-```{julia}
-
-sarray = sample_array(pt_brownian_regression)[:,:,1]
-snames = sample_names(pt_brownian_regression)
-
-df_brownian_regression = DataFrame(sarray, :auto)
-rename!(df_brownian_regression, snames)
-insertcols!(
-    df_brownian_regression,
-    1,
-    :tree_index => [Int(ceil(cdf(Normal(), v) * length(pruned_trees))) for v in df_brownian_regression.latent_index],
-    :rate => exp.(df_brownian_regression.u_rate)
-)
-
-samples = Chains(Array(df_brownian_regression), names(df_brownian_regression))
-
-
-samples[:, [:α, :β, :rate, :tree_index], :] |> display
-
-samples[:, [:α, :β, :rate, :tree_index], :] |> plot
-
-```
-
-
-```{julia}
-
-@model function brownian_marg(vcv_matrices, x, y)
-    n_data = length(x)
-    n_trees = length(vcv_matrices)
-        # Center x
-    X_centered = x .- mean(x)
-
-        # Priors
-    α ~ LocationScale(0, 2.5, TDist(3)) 
-    β ~ Normal(0, 2)
-    u_rate ~ Normal(0, 1)
-    rate := exp(u_rate)
-    latent_index ~ Normal()
-    tree_index := Int(ceil(cdf(Normal(), latent_index) * n_trees))
-    vcv = vcv_matrices[tree_index]
-    eta = α .+ β .* X_centered
-
-    a = [-Inf, 0.][y .+ 1]
-    b = [0.0, Inf][y .+ 1]
-    ll = log(mvnormcdf(eta, vcv, a, b)[1])
-    Turing.@addlogprob! ll
-end
-
-
-```
-
-
-
-```{julia}
-
-function brownian_marg_target(vcv_matrices=vcv_matrices, x=d.x, y=d.y)
-    return Pigeons.TuringLogPotential(brownian_marg(vcv_matrices, x, y))
-end
-
-BrownianMargType = typeof(brownian_marg_target())
-
-function Pigeons.initialization(target::BrownianMargType, rng::AbstractRNG, ::Int64)
-    result = DynamicPPL.VarInfo(rng, target.model, DynamicPPL.SampleFromPrior(), DynamicPPL.PriorContext())
-    result = DynamicPPL.link(result, target.model)
-    Pigeons.update_state!(result, :latent_index, 1, rand(Normal()))
-    return result
-end
-
-inputs_brownian_marg = Inputs(
-    target = brownian_marg_target(),
-    multithreaded = true,
-    record = [traces; record_default()]
-)
-
-
-pt_brownian_marg = pigeons(inputs_brownian_marg)
 
 ```
