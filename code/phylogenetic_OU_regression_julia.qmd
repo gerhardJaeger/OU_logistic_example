@@ -167,24 +167,27 @@ First we implement the model in Turing.jl. The model is a simple multivariate lo
 #| vscode: {languageId: julia}
 
 @model function vanilla_correlation(N)
-    
     # Priors
-    mu ~ filldist(Normal(0, 2.5), 2)
-    rho ~ Uniform(-0.95, 0.95)  # Correlation coefficient in (-0.95, 0.95)
-    
+    mu ~ MvNormal(zeros(2), 1)
+    rho ~ Uniform(-1.0, 1.0)  # Correlation coefficient in (-0.95, 0.95)
+    sigma ~ filldist(LogNormal(0.0, 1.0), 2)  # Standard deviations for each variable
+
     # Add small regularization for numerical stability
-    eps = 1e-6
-    Sigma = [
-        1.0+eps rho
-        rho 1.0+eps
+    Sigma_l = [
+        1.0 0
+        rho sqrt(1-rho^2)
     ]
-    z ~ filldist(MvNormal(mu, Sigma), N)
-    x ~ product_distribution(BernoulliLogit.(z[1,:]))
-    y ~ product_distribution(BernoulliLogit.(z[2,:]))
+    
+    z_std ~ filldist(MvNormal(zeros(2), 1), N)
+    z := (Sigma_l * z_std) .* sigma .+ mu
+    x ~ product_distribution(BernoulliLogit.(z[1, :]))
+    y ~ product_distribution(BernoulliLogit.(z[2, :]))
 end
 
-
 ```
+
+
+
 
 In this notebook, I will use the `Pigeons` package to fit the model. Pigeons is a Julia package implementing *parallel tempering* sampling. It is based on Slice sampling, i.e., a sampling method not using automatic differentiation. This makes it possible to include discrete variables alongside continuous ones, which is useful handling phylogenetic uncertainty.
 
@@ -193,10 +196,9 @@ Parallel tempering is comparatively slow. I still chose it because it computes b
 
 ```{julia}
 
-
 inputs_vanilla_correlation = Inputs(
     target=TuringLogPotential(vanilla_correlation(nrow(d)) | (x=d.x, y=d.y)),
-    n_chains = 2,
+    n_chains = 4,
     multithreaded=true,
     record = [traces; record_default()]
 )
@@ -212,7 +214,7 @@ println(stepping_stone(pt_vanilla_correlation))
 
 chain_vanilla_correlation = Chains(sample_array(pt_vanilla_correlation), sample_names(pt_vanilla_correlation))
 
-nms = [nm for nm in sample_names(pt_vanilla_correlation) if !occursin("z", string(nm)) && !occursin("loglik", string(nm)) && !occursin("y_rep", string(nm)) && !occursin("x_rep", string(nm))]
+nms = [nm for nm in sample_names(pt_vanilla_correlation) if !occursin("z", string(nm))]
 
 display(chain_vanilla_correlation[:, nms, :])
 
@@ -225,7 +227,7 @@ plot(chain_vanilla_correlation[:, nms, :])
 ```{julia}
 #| vscode: {languageId: julia}
 
-hpd(chain_vanilla_correlation[:, ["mu[1]", "mu[2]", "rho"], :])
+hpd(chain_vanilla_correlation[:, ["mu[1]", "mu[2]", "sigma[1]", "sigma[2]", "rho"], :])
 ```
 
 ```{julia}
@@ -245,17 +247,23 @@ prior_chain = Turing.sample(vanilla_correlation(nrow(d)), Prior(), length(chain_
 
 # Posterior predictive sampling - use the fitted chain
 
-x_rep_names = [v for v in names(prior_chain) if occursin("x", string(v))]
 
-y_rep_names = [v for v in names(prior_chain) if occursin("y", string(v))]
 
-x_prior = Int.(Array(prior_chain[:, x_rep_names, :]))
+x_prior = Int.(hcat([prior_chain[:, "x[$i]", :] for i in 1:nrow(d)]...))
 
-y_prior = Int.(Array(prior_chain[:, y_rep_names, :]))
+y_prior = Int.(hcat([prior_chain[:, "y[$i]", :] for i in 1:nrow(d)]...))
 
-x_posterior = hcat([rand(product_distribution(BernoulliLogit.(chain_vanilla_correlation[:,"z[$(2*i-1)]", :]))) for i in 1:nrow(d)]...)
+posterior_chain = Turing.sample(vanilla_correlation(nrow(d)) | (x=d.x, y=d.y), NUTS(), length(chain_vanilla_correlation))
 
-y_posterior = hcat([rand(product_distribution(BernoulliLogit.(chain_vanilla_correlation[:,"z[$(2*i)]", :]))) for i in 1:100]...)
+x_posterior = hcat(
+    [rand(product_distribution(BernoulliLogit.(posterior_chain[:,"z[1, $i]", :]))) for i in 1:nrow(d)]...
+)
+
+y_posterior = hcat(
+    [rand(product_distribution(BernoulliLogit.(posterior_chain[:,"z[2, $i]", :]))) for i in 1:nrow(d)]...
+)
+
+
 
 prior_cors = [cor(x_prior[i, :], y_prior[i, :]) for i in 1:size(x_prior, 1)]
 # Remove NaNs from prior_cors
@@ -280,7 +288,7 @@ vline!([cor(d.x, d.y)])
 
 ```{julia}
 
-loglik_vanilla_correlation = hcat([logpdf.(BernoulliLogit.(chain_vanilla_correlation[:,"z[$(2*i-1)]", :]), d.x[i]) .+ logpdf.(BernoulliLogit.(chain_vanilla_correlation[:,"z[$(2*i)]", :]), d.y[i]) for i in 1:nrow(d)]...)
+loglik_vanilla_correlation = hcat([logpdf.(BernoulliLogit.(posterior_chain[:,"z[1, $i]", :]), d.x[i]) .+ logpdf.(BernoulliLogit.(posterior_chain[:,"z[2, $i]", :]), d.y[i]) for i in 1:nrow(d)]...)
 
 
 #| vscode: {languageId: julia}
@@ -333,32 +341,57 @@ And now the model for logistic correlation with a Brownian motion phylogenetic s
 
 Here I define a continuous variable `latent_index` that is sampled from a uniform distribution between 0 and the number of trees. This variable is mapped to an integer via the ceiling function and then used to select a tree from the set of pruned trees. The `clamp` function ensures that the index is within the valid range of tree indices.
 
+
 ```{julia}
+function get_vcv(tree; taxa=taxa)
+    root = getroot(tree)
+    tips = getleaves(tree)
+    tip_names = getleafnames(tree)
+    vcv = zeros(length(tips), length(tips))
 
-@model function brownian_correlation(pruned_trees, taxa)
-    rho ~ Uniform(-0.999, 0.999)
-    Sigma = [1.0 rho; rho 1.0]
-    n = length(pruned_trees)
-    latent_index ~ Uniform(0, n)
-    tree_index = clamp(Int(ceil(latent_index)), 1, n)
-    tree = pruned_trees[tree_index]
-    rates ~ filldist(LogNormal(0.0, 1.0), 2)
-
-    root, mothers, daughters, lengths, nodes_dict = decompose_tree(tree)
-    z_std ~ filldist(MvNormal(zeros(2), Sigma), length(mothers))
-    z = zeros(Float64, (2, length(nodes_dict)))
-    mu ~ filldist(Normal(0, 10.0), 2)
-    z[:, nodes_dict[root]] .= mu
-    for i in length(mothers):-1:1
-        dgt = nodes_dict[daughters[i]]
-        mth = nodes_dict[mothers[i]]
-        for k in 1:2
-            z[k, dgt] = z[k, mth] + sqrt(rates[k] * lengths[i]) * z_std[k, i]
+    # Compute VCV matrix (upper triangle only)
+    for i in 1:length(tips)
+        for j in i:length(tips)
+            if i == j
+                # Diagonal: total distance from root to tip (variance)
+                vcv[i, j] = distance(tree, root, tips[i])
+            else
+                # Off-diagonal: shared evolutionary time (distance from root to MRCA)
+                vcv[j, i] = vcv[i, j] = distance(tree, root, mrca(tree, [tips[i], tips[j]]))
+            end
         end
     end
-    z_tips = hcat([z[:, nodes_dict[l]] for l in taxa]...)
-    x ~ product_distribution(BernoulliLogit.(z_tips[1,:]))
-    y ~ product_distribution(BernoulliLogit.(z_tips[2,:]))
+    return vcv[indexin(tip_names, taxa), indexin(tip_names, taxa)]
+end
+```
+
+```{julia}
+scaled_vcv_matrices = [get_vcv(t) ./ 100 for t in pruned_trees]
+scaled_cholesky_matrices = [cholesky(m).L for m in scaled_vcv_matrices]
+```
+
+
+```{julia}
+
+@model function brownian_correlation(scaled_cholesky_matrices, taxa)
+    rho ~ Uniform(-1., 1)
+    Sigma_l = [
+        1.0 0.0
+        rho sqrt(1.0 - rho^2)
+    ]
+    n = length(scaled_cholesky_matrices)
+    latent_index ~ Uniform(0, n)
+    tree_index = clamp(Int(ceil(latent_index)), 1, n)
+    m = scaled_cholesky_matrices[tree_index]
+    rates ~ filldist(LogNormal(0.0, 1.0), 2)
+    mu ~ MvNormal(zeros(2), 10)
+
+    z_std ~ filldist(MvNormal(zeros(2), 1), length(taxa))
+    z_cor = (Sigma_l * z_std) .* rates 
+    z := z_cor * m .+ mu
+
+    x ~ product_distribution(BernoulliLogit.(z[1,:]))
+    y ~ product_distribution(BernoulliLogit.(z[2,:]))
 end
 
 ```
@@ -369,7 +402,7 @@ end
 
 
 inputs_brownian_correlation = Inputs(
-    target=TuringLogPotential(brownian_correlation(pruned_trees, taxa) | (x=d.x, y=d.y)),
+    target=TuringLogPotential(brownian_correlation(scaled_cholesky_matrices, taxa) | (x=d.x, y=d.y)),
     n_chains = 2,
     multithreaded=true,
     record = [traces; record_default()]
@@ -380,4 +413,125 @@ pt_brownian_correlation = pigeons(inputs_brownian_correlation)
 println(stepping_stone(pt_brownian_correlation))
 
 
+```
+
+
+```{julia}
+
+chain_brownian_correlation = Chains(sample_array(pt_brownian_correlation), sample_names(pt_brownian_correlation))
+
+nms = [nm for nm in sample_names(pt_brownian_correlation) if !occursin("z", string(nm))]
+
+display(chain_brownian_correlation[:, nms, :])
+
+plot(chain_brownian_correlation[:, nms, :])
+
+```
+
+
+
+```{julia}
+#| vscode: {languageId: julia}
+
+hpd(chain_brownian_correlation[:, ["mu[1]", "mu[2]", "rates[1]", "rates[2]", "rho"], :])
+```
+
+```{julia}
+#| vscode: {languageId: julia}
+# plot the posterior distributions of alpha and beta
+gr()
+ridgelineplot(chain_brownian_correlation, [:rho], title="Posterior distributions of ρ")
+
+```
+
+
+```{julia}
+
+
+
+
+# Prior predictive sampling 
+prior_chain = Turing.sample(brownian_correlation(tree_cholesky, taxa), Prior(), length(chain_brownian_correlation))
+
+
+```
+
+```{julia}
+x_prior = Int.(hcat([prior_chain[:, "x[$i]", :] for i in 1:nrow(d)]...))
+
+y_prior = Int.(hcat([prior_chain[:, "y[$i]", :] for i in 1:nrow(d)]...))
+```
+
+
+```{julia}
+chain_brownian_correlation = Turing.sample(
+    brownian_correlation(tree_cholesky, taxa) | (x=d.x, y=d.y), 
+    Gibbs(
+        MH(:latent_index),
+        NUTS(:mu, :rho, :rates, :z_std),
+    ),
+    MCMCThreads(),
+    100,
+    4,
+)
+chain_brownian_correlation[:, nms, :] |> display
+
+```
+
+
+```{julia}
+x_posterior = hcat(
+    [rand(product_distribution(BernoulliLogit.(posterior_chain[:,"z[1, $i]", :]))) for i in 1:nrow(d)]...
+)
+
+y_posterior = hcat(
+    [rand(product_distribution(BernoulliLogit.(posterior_chain[:,"z[2, $i]", :]))) for i in 1:nrow(d)]...
+)
+
+
+
+prior_cors = [cor(x_prior[i, :], y_prior[i, :]) for i in 1:size(x_prior, 1)]
+# Remove NaNs from prior_cors
+prior_cors = filter(!isnan, prior_cors)
+
+posterior_cors = [cor(x_posterior[i, :], y_posterior[i, :]) for i in 1:size(x_posterior, 1)]
+# Remove NaNs from posterior_cors
+posterior_cors = filter(!isnan, posterior_cors)
+
+df = DataFrame(
+    cor = vcat(prior_cors, posterior_cors),
+    type = vcat(fill("prior", length(prior_cors)), fill("posterior", length(posterior_cors)))
+)
+
+@df df density(:cor, group=:type, title="Prior and Posterior Correlation Distributions", xlabel="Correlation", ylabel="Density")
+vline!([cor(d.x, d.y)])
+
+```
+
+
+
+
+```{julia}
+
+loglik_vanilla_correlation = hcat([logpdf.(BernoulliLogit.(posterior_chain[:,"z[1, $i]", :]), d.x[i]) .+ logpdf.(BernoulliLogit.(posterior_chain[:,"z[2, $i]", :]), d.y[i]) for i in 1:nrow(d)]...)
+
+
+#| vscode: {languageId: julia}
+# Compute LOOIC
+loo_vanilla_correlation = convert(
+    Dict,
+    R"
+    library(loo)
+    loo($(loglik_vanilla_correlation))
+    ",
+);
+```
+
+```{julia}
+println("LOO Results:")
+loo_results_vanilla_correlation = format_loo_results(loo_vanilla_correlation)
+println(loo_results_vanilla_correlation)
+```
+
+```{julia}
 ```
