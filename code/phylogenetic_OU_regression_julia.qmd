@@ -372,13 +372,13 @@ scaled_cholesky_matrices = [cholesky(m).L for m in scaled_vcv_matrices]
 @model function brownian_correlation(scaled_cholesky_matrices, taxa)
     n = length(scaled_cholesky_matrices)
     rho_u ~ Normal()
-    rho := cdf(Normal(), rho_u)
+    rho := 2 * cdf(Normal(), rho_u) - 1
     Sigma_l = [1 0.0; rho sqrt(1-rho^2)]
     tree_index_u ~ Normal()
     tree_index := Int(ceil(cdf(Normal(), tree_index_u) * n))
     m = scaled_cholesky_matrices[tree_index]
     rates_u ~ filldist(Normal(), 2)
-    rates := -log1p.(-cdf.(Normal(), rates_u))
+    rates := exp.(rates_u)
     mu ~ MvNormal(zeros(2), 2)
 
     z_std ~ filldist(MvNormal(zeros(2), 1), length(taxa))
@@ -391,21 +391,22 @@ end
 ```
 
 ```{julia}
+Random.seed!(122)
+
 chain_brownian_correlation = Turing.sample(
     brownian_correlation(scaled_cholesky_matrices, taxa) | (x=d.x, y=d.y),
-    Gibbs(
-        :tree_index_u => MH(),
-        (:rho_u, :mu, :rates_u, :z_std) => NUTS(2_000, 0.90; max_depth=12) 
-    ),
+    MH(),
     MCMCThreads(),
-    10_000,   # samples
-    4        # chains
+    num_warmup = 50_000,
+    100_000,   # samples
+    4,        # chains
+    thinning = 10,
 )
 
 
 nms = [nm for nm in names(chain_brownian_correlation) if !occursin("z", string(nm)) && !occursin("Sigma", string(nm)) && !occursin("_u", string(nm))]
 
-describe(chain_brownian_correlation[:, nms, :])
+describe(chain_brownian_correlation[:, nms, 2])
 
 plot(chain_brownian_correlation[:, nms, :], size=(600, 900))
 
@@ -424,7 +425,7 @@ hpd(chain_brownian_correlation[:, ["mu[1]", "mu[2]", "rates[1]", "rates[2]", "rh
 #| vscode: {languageId: julia}
 # plot the posterior distributions of alpha and beta
 gr()
-ridgelineplot(chain_brownian_correlation[:,:,[1,3,4]], [:rho], title="Posterior distributions of ρ")
+ridgelineplot(chain_brownian_correlation, [:rho], title="Posterior distributions of ρ")
 
 ```
 
@@ -498,20 +499,4 @@ loo_brownian_correlation = convert(
 println("LOO Results:")
 loo_results_brownian_correlation = format_loo_results(loo_brownian_correlation)
 println(loo_results_brownian_correlation)
-```
-
-```{julia}
-
-target = TuringLogPotential(brownian_correlation(scaled_cholesky_matrices, taxa) | (x=d.x, y=d.y))
-
-
-pt = pigeons(
-    seed = 1234,
-    target = target,
-    n_chains = 4,
-    multithreaded = true,
-    record = [traces; record_default()]
-)
-
-
 ```
