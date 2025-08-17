@@ -516,17 +516,43 @@ scaled_phy_distances = [(m+m') / 2 for m in scaled_phy_distances]
 ```
 
 
+```{julia}
+
+function decompose_tree(
+    tree::RootedTree
+)::@NamedTuple{root::String, mothers::Vector{String}, daughters::Vector{String}, lengths::Vector{Float64}, nodes_dict::Dict{String,Int64}}
+    root = getroot(tree).name
+    mothers = String[]
+    daughters = String[]
+    lengths = Float64[]
+    for nd in traversal(tree, postorder)
+        if !isroot(tree, nd)
+            mother = getparent(tree, nd)
+            br = getinbound(tree, nd)
+            bl = getlength(tree, br)
+            push!(mothers, mother.name)
+            push!(daughters, nd.name)
+            push!(lengths, bl)
+        end
+    end
+
+    nodes = sort!(unique(vcat(mothers, daughters)))
+    nodes_dict = Dict{String,Int}(nodes .=> 1:length(nodes))
+    (root=root, mothers=mothers, daughters=daughters, lengths=lengths, nodes_dict=nodes_dict)
+end
+
+```
 
 ```{julia}
 
-@model function OU_correlation(scaled_phy_distances, taxa)
-    n = length(scaled_phy_distances)
+@model function OU_correlation(pruned_trees, taxa)
+    n = length(pruned_trees)
     rho_u ~ Normal()
     rho := 2 * cdf(Normal(), rho_u) - 1
     Sigma_l = [1 0.0; rho sqrt(1-rho^2)]
     tree_index_u ~ Normal()
     tree_index := Int(ceil(cdf(Normal(), tree_index_u) * n))
-    m = scaled_phy_distances[tree_index]
+    tree = pruned_trees[tree_index]
 
     sigma_u ~ filldist(Normal(), 2)
     sigma := exp.(sigma_u)
@@ -534,21 +560,33 @@ scaled_phy_distances = [(m+m') / 2 for m in scaled_phy_distances]
     lambda_u ~ filldist(Normal(), 2)
     lambda := exp.(lambda_u)
 
-    Sigma_OU_1 := sigma[1]^2/(2*lambda[1]) * exp.(-lambda[1] * m)
-    Sigma_OU_2 := sigma[2]^2/(2*lambda[2]) * exp.(-lambda[2] * m)
-    
-    L_1 = cholesky(Sigma_OU_1).L
-    L_2 = cholesky(Sigma_OU_2).L
-
     mu ~ MvNormal(zeros(2), 2)
 
-    z_std ~ filldist(MvNormal(zeros(2), 1), length(taxa))
-    z_cor = Sigma_l * z_std
-    z_1 = L_1 * z_cor[1,:] .+ mu[1]
-    z_2 = L_2 * z_cor[2,:] .+ mu[2]
+    root, mothers, daughters, lengths, nodes_dict = decompose_tree(tree)
 
-    x ~ product_distribution(BernoulliLogit.(z_1))
-    y ~ product_distribution(BernoulliLogit.(z_2))
+    z_std ~ filldist(MvNormal(zeros(length(mothers)), ones(length(mothers))), 2)
+    
+
+    z_cor = z_std * Sigma_l
+
+    root_states ~ MvNormal(mu, sigma ./ sqrt.(2 .* lambda))
+
+    z = zeros(Float64, (length(nodes_dict), 2))
+    z[nodes_dict[root], :] .= root_states
+
+    for i in length(mothers):-1:1
+        dgt = nodes_dict[daughters[i]]
+        mth = nodes_dict[mothers[i]]
+        len = lengths[i]
+        decay = exp.(-lambda .* len)
+        s = sigma .* sqrt.(-expm1.(-2 .* lambda .* len) ./ (2 .* lambda))
+        mn = mu + (z[mth, :] .- mu) .* decay
+        z[dgt, :] = mn + s .* z_cor[i, :]
+    end
+    z_tips = hcat([z[nodes_dict[l], :] for l in taxa]...)
+
+    x ~ product_distribution(BernoulliLogit.(z_tips[1,:]))
+    y ~ product_distribution(BernoulliLogit.(z_tips[2,:]))
 end
 
 ```
@@ -557,7 +595,7 @@ end
 Random.seed!(122)
 
 chain_OU_correlation = Turing.sample(
-    OU_correlation(scaled_cholesky_matrices, taxa) | (x=d.x, y=d.y),
+    OU_correlation(pruned_trees, taxa) | (x=d.x, y=d.y),
     MH(),
     MCMCThreads(),
     num_warmup = 50_000,
