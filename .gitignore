@@ -3,3 +3,4 @@ code/*.rds
 code/.localvscode
 data/all_trees/
 code/Manifest.toml
+code/.vscode/**

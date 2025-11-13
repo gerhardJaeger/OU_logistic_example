@@ -24,3 +24,5 @@ dependencies:
   - r-ggnewscale
   - r-cowplot
   - r-brms
+  - r-scico
+  - r-bh
