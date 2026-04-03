@@ -36,6 +36,11 @@ suppressPackageStartupMessages({
     library(parallel)
     rstan_options(auto_write = TRUE)
     options(mc.cores = parallel::detectCores())  # Enable parallel Stan sampling
+    # Workaround for rstan 2.32+ sink conflict with knitr output capture
+    stan_model <- function(...) {
+      while (sink.number() > 0) sink()
+      rstan::stan_model(...)
+    }
     library(ape)
     library(R.utils)
     library(bridgesampling)
