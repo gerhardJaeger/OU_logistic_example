@@ -19,6 +19,7 @@ This notebook makes the case for OU-based models in phylogenetic typology. We fi
 The git repository https://github.com/gerhardJaeger/OU_logistic_example holds the source code for this notebook. It contains a file `OU_logistic_example.yml`. You can use it to set up a conda environment containing all the required packages. (Of course you can also install the packages with `install.packages` if you don't use conda.) At the command prompt, in the home directory of the repository, do
 
 ```{bash}
+#| eval: false
 conda env create -f OU_logistic_example.yml
 conda activate OU_logistic_example
 ```
