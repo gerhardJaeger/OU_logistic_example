@@ -6,6 +6,7 @@ channels:
 dependencies:
   - r-base
   - r-r.utils
+  - tbb=2020.*
   - r-rstan
   - r-tidyverse
   - r-ape
