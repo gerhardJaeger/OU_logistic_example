@@ -1844,6 +1844,7 @@ Essentially, what you have to do is:
 - In the Stan model, you have to loop over all edges in all trees. So the phylogenetic recursion should look like
 
 ```{stan}
+#| eval: false
 for (tr in 1:Ntrees) {
     for (e in 1:Nedges) {
         int parent = edges[e, 1, tr];
@@ -1857,6 +1858,7 @@ for (tr in 1:Ntrees) {
 - Inside the model block, add the line
 
 ```{stan}
+#| eval: false
 target -= log(Ntrees);
 ```
 
