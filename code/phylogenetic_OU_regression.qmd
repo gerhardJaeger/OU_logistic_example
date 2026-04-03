@@ -48,6 +48,11 @@ suppressPackageStartupMessages({
     library(bayesplot)
     library(codetools)
     library(ggtree)
+    # Workaround for yulab.utils cache initialization bug in non-interactive rendering
+    local({
+      unlockBinding("is_ggtree_interactive", asNamespace("ggtree"))
+      assign("is_ggtree_interactive", function() FALSE, envir = asNamespace("ggtree"))
+    })
     library(posterior)
     library(tidybayes)
     library(ggthemes)
@@ -296,7 +301,14 @@ generated quantities {
     }
 }
 "
-system.time(stan_model_vanilla <- stan_model(model_code = stan_code_vanilla))
+system.time(
+  if (file.exists("stan_model_vanilla.rds")) {
+    stan_model_vanilla <- readRDS("stan_model_vanilla.rds")
+  } else {
+    stan_model_vanilla <- stan_model(model_code = stan_code_vanilla)
+    saveRDS(stan_model_vanilla, "stan_model_vanilla.rds")
+  }
+)
 ```
 
 ```{r}
@@ -519,7 +531,14 @@ generated quantities {
 }
 
 "
-system.time(stan_model_vanilla_corr <- stan_model(model_code = stan_code_vanilla_corr))
+system.time(
+  if (file.exists("stan_model_vanilla_corr.rds")) {
+    stan_model_vanilla_corr <- readRDS("stan_model_vanilla_corr.rds")
+  } else {
+    stan_model_vanilla_corr <- stan_model(model_code = stan_code_vanilla_corr)
+    saveRDS(stan_model_vanilla_corr, "stan_model_vanilla_corr.rds")
+  }
+)
 ```
 
 ```{r}
@@ -825,7 +844,14 @@ generated quantities {
 
 "
 
-system.time(stan_model_ctmc_independent <- stan_model(model_code= stan_model_code_ctmc_independent))
+system.time(
+  if (file.exists("ctmc_independent.rds")) {
+    stan_model_ctmc_independent <- readRDS("ctmc_independent.rds")
+  } else {
+    stan_model_ctmc_independent <- stan_model(model_code = stan_model_code_ctmc_independent)
+    saveRDS(stan_model_ctmc_independent, "ctmc_independent.rds")
+  }
+)
 ```
 
 ```{r}
@@ -1041,7 +1067,14 @@ generated quantities {
     }
 }
 "
-system.time(stan_model_ctmc_dependent <- stan_model(model_code = stan_model_code_ctmc_dependent))
+system.time(
+  if (file.exists("ctmc_dependent.rds")) {
+    stan_model_ctmc_dependent <- readRDS("ctmc_dependent.rds")
+  } else {
+    stan_model_ctmc_dependent <- stan_model(model_code = stan_model_code_ctmc_dependent)
+    saveRDS(stan_model_ctmc_dependent, "ctmc_dependent.rds")
+  }
+)
 ```
 
 ```{r}
@@ -1278,7 +1311,14 @@ generated quantities {
 }
 
 "
-system.time(stan_model_OU_regression <- stan_model(model_code = stan_model_code_OU_regression))
+system.time(
+  if (file.exists("OU_regression.rds")) {
+    stan_model_OU_regression <- readRDS("OU_regression.rds")
+  } else {
+    stan_model_OU_regression <- stan_model(model_code = stan_model_code_OU_regression)
+    saveRDS(stan_model_OU_regression, "OU_regression.rds")
+  }
+)
 ```
 
 ```{r}
