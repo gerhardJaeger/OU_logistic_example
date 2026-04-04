@@ -11,14 +11,12 @@ Pkg.activate(".")
 
 using CSV
 using DataFrames
-using DataFramesMeta
 using Distributions
 using DynamicPPL
 using ExponentialUtilities
 using LinearAlgebra
 using LogDensityProblems
 using Phylo
-using Pipe
 using Random
 using RCall
 using Statistics
@@ -27,8 +25,6 @@ using StatsFuns
 using JLD2
 using Turing
 using Pigeons
-using CodecZlib: GzipDecompressor
-using Downloads
 
 include("bridge_sampling.jl")
 
@@ -56,41 +52,10 @@ library(ape)
 .full_tree <- read.nexus($tree_file)
 """
 
-grambank_file = "../data/grambank_vals.csv"
-if !isfile(grambank_file)
-    Downloads.download(
-        "https://raw.githubusercontent.com/grambank/grambank/refs/heads/master/cldf/values.csv",
-        grambank_file
-    )
-end
-
-vals = CSV.read(grambank_file, DataFrame)
-
-all_tip_labels = rcopy(R".full_tree$tip.label")
-tip_names = Set(all_tip_labels)
-
-d = @pipe vals |>
-    filter(r -> r.Language_ID ∈ tip_names, _) |>
-    filter(r -> r.Parameter_ID ∈ ["GB193", "GB133"], _) |>
-    select(_, [:Language_ID, :Parameter_ID, :Value]) |>
-    dropmissing |>
-    filter(r -> r.Value ∈ ["0", "1", "2"], _) |>
-    DataFrames.transform(_, :Value => (v -> parse.(Int, v)) => :Value) |>
-    unstack(_, :Parameter_ID, :Value) |>
-    dropmissing |>
-    filter(r -> r.GB193 > 0, _)
-
-d[!, :x] = d.GB193 .- 1
-d[!, :y] = d.GB133
-
-if isfile("../data/grambank_vals_pruned.csv")
-    d = CSV.read("../data/grambank_vals_pruned.csv", DataFrame)
-else
-    Random.seed!(123)
-    sample_idx = sort(sample(1:nrow(d), 100; replace=false))
-    d = d[sample_idx, :]
-    CSV.write("../data/grambank_vals_pruned.csv", d)
-end
+# Load pruned dataset directly — it was created by the notebook and already has x, y columns.
+pruned_csv = "../data/grambank_vals_pruned.csv"
+isfile(pruned_csv) || error("Run the notebook first to create $pruned_csv")
+d = CSV.read(pruned_csv, DataFrame)
 
 keep_langs = d.Language_ID
 R"""
