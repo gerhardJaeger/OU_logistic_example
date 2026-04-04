@@ -1226,9 +1226,7 @@ vline!([cor(d.x, d.y)], label="observed", color=:red)
 
 ```{julia}
 loglik_OU_correlation_y = hcat([
-    logpdf.(BernoulliLogit.(
-        chain_OU_correlation[:, Symbol("z[$(tree_info.nodes_dict[taxa[i]]), 2]"), :]
-    ), d.y[i])
+    logpdf.(BernoulliLogit.(vec(Array(chain_OU_correlation[:, Symbol("y_logits[$i]"), :]))), d.y[i])
     for i in 1:nrow(d)
 ]...)
 
