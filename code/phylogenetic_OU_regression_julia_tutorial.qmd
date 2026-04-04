@@ -35,8 +35,10 @@ using DataFramesMeta
 using Distributions
 using Downloads
 using DynamicPPL
+using ExponentialUtilities
 using LinearAlgebra
 using LogDensityProblems
+using LogExpFunctions
 using MCMCChains
 using Optim
 using Phylo
@@ -434,138 +436,243 @@ We implement Felsenstein's pruning algorithm in Julia directly.
 
 The joint state encoding is: $\text{state} = 2x + y + 1 \in \{1,2,3,4\}$.
 
-### Helper: matrix exponential and pruning
+### Helper functions: rate matrix, stationary distribution, and Felsenstein pruning
+
+The reference implementation separates three concerns: (1) building the $Q$ matrix from a vector of raw rates, (2) computing the stationary distribution via a linear solve, and (3) the pruning recursion itself. This factoring keeps each piece reusable and makes the Turing model definitions clean.
 
 ```{julia}
-using LinearAlgebra: exp  # matrix exponential via expm
+const N_STATES_CTMC = 4
+const N_RATES_INDEP = 4   # independent model
+const N_RATES_DEP   = 8   # dependent model
 
 """
-    felsenstein_pruning(Q, edge_parents, edge_children, edge_lengths,
-                        tip_states, n_nodes, root_node)
+    rates_to_Q(rates, n_states)
 
-Compute the Felsenstein pruning log-likelihood for a CTMC model.
-`tip_states[i]` is the 1-based joint state index for tip i (or 0 for missing).
-Returns the scalar log-likelihood.
+Build a rate matrix Q from a vector of raw (positive) off-diagonal rates.
+Rates are filled row-major upper triangle then lower triangle.
+For the 4-state CTMC the layout matches the Pagel & Meade ordering:
+  upper: (0,0)→(0,1), (0,0)→(1,0), (0,1)→(1,1), (1,0)→(1,1)
+  lower: (0,1)→(0,0), (1,0)→(0,0), (1,1)→(0,1), (1,1)→(1,0)
+The diagonal is set so that each row sums to zero.
 """
-function felsenstein_pruning(
-    Q::Matrix{Float64},
-    edge_parents::Vector{Int},
-    edge_children::Vector{Int},
-    edge_lengths::Vector{Float64},
-    tip_states::Vector{Int},
-    n_nodes::Int,
-    root_node::Int,
-    n_tips::Int
-)
-    # Stationary distribution: long-run matrix exponential
-    P_long = exp(Q * 1e3)
-    stat_dist = vec(P_long[1, :])
-    stat_dist ./= sum(stat_dist)
-
-    # Initialize log-likelihoods at each node
-    loglik = fill(-Inf, n_nodes, 4)
-
-    # Tip likelihoods
-    for i in 1:n_tips
-        s = tip_states[i]
-        loglik[i, s] = 0.0
+function rates_to_Q(rates::AbstractVector{T}, n::Int) where T <: Real
+    Q = zeros(T, n, n)
+    k = 1
+    for i in 1:n, j in (i+1):n
+        Q[i, j] = rates[k]; k += 1
     end
+    for i in 2:n, j in 1:(i-1)
+        Q[i, j] = rates[k]; k += 1
+    end
+    for i in 1:n
+        Q[i, i] = -sum(Q[i, :])
+    end
+    return Q
+end
 
-    # Pruning: postorder = edges listed in postorder already
-    for e in 1:length(edge_parents)
-        parent = edge_parents[e]
-        child  = edge_children[e]
-        t      = edge_lengths[e]
-        Pt = exp(Q * t)
-        for k in 1:4
-            loglik[parent, k] += logsumexp(log.(Pt[k, :]) .+ loglik[child, :])
+"""
+    stationary_dist(Q)
+
+Compute the stationary distribution of Q by solving the over-determined
+linear system [Q'; 1ᵀ] π = [0; 1] via least squares.
+This is more numerically stable than a long-run matrix exponential.
+"""
+function stationary_dist(Q::AbstractMatrix{T}) where T <: Real
+    n = size(Q, 1)
+    A = vcat(Q', ones(T, 1, n))
+    b = vcat(zeros(T, n), one(T))
+    return A \ b
+end
+
+"""
+    pruning_loglik(s, edges, edge_lengths, root_node, n_nodes, n_tips, Q, stat)
+
+Felsenstein pruning log-likelihood for a 4-state CTMC.
+- `s[i]`           : 1-based observed state at tip i (tips are nodes 1..n_tips)
+- `edges`          : (Nedges × 2) matrix, 1-based local node indices, postorder
+- `edge_lengths`   : branch lengths, same ordering as edges
+- `root_node`      : index of the root node
+- `n_nodes`        : total number of nodes
+- `n_tips`         : number of tip taxa
+- `Q`              : 4×4 rate matrix
+- `stat`           : stationary distribution (length-4 vector)
+
+Uses `ExponentialUtilities.exponential!` for the matrix exponential, which is
+compatible with ForwardDiff dual numbers and therefore works with NUTS.
+"""
+function pruning_loglik(
+    s::Vector{Int},
+    edges::Matrix{Int},
+    edge_lengths::Vector{Float64},
+    root_node::Int,
+    n_nodes::Int,
+    n_tips::Int,
+    Q::AbstractMatrix{T},
+    stat::AbstractVector{T}
+) where T <: Real
+    # ll[node, state]: log conditional likelihood at each node
+    ll = Matrix{T}(undef, n_nodes, N_STATES_CTMC)
+
+    # Tip initialisation: hard assignment to observed state
+    for i in 1:n_tips
+        st = s[i]  # 1-based
+        for k in 1:N_STATES_CTMC
+            ll[i, k] = k == st ? zero(T) : T(-Inf)
         end
     end
 
-    logsumexp(loglik[root_node, :] .+ log.(stat_dist))
+    # Internal node initialisation: uninformative (log 1 = 0)
+    for i in (n_tips+1):n_nodes, k in 1:N_STATES_CTMC
+        ll[i, k] = zero(T)
+    end
+
+    # Post-order pruning
+    for e in 1:size(edges, 1)
+        parent = edges[e, 1]
+        child  = edges[e, 2]
+
+        # Transition probability matrix P(t) = expm(Q * t)
+        # exponential! is in-place and ForwardDiff-compatible
+        Pt = Q * edge_lengths[e]
+        exponential!(Pt)
+
+        for k in 1:N_STATES_CTMC
+            acc = T(-Inf)
+            for j in 1:N_STATES_CTMC
+                v = log(max(Pt[k, j], eps(Float64))) + ll[child, j]
+                # Skip impossible child states to avoid NaN in ForwardDiff derivatives
+                isfinite(v) || continue
+                acc = isinf(acc) ? v : logaddexp(acc, v)
+            end
+            ll[parent, k] += acc
+        end
+    end
+
+    # Root marginal: weight by stationary distribution
+    root_ll = T(-Inf)
+    for k in 1:N_STATES_CTMC
+        v = ll[root_node, k] + log(max(stat[k], eps(Float64)))
+        isfinite(v) || continue
+        root_ll = isinf(root_ll) ? v : logaddexp(root_ll, v)
+    end
+    return root_ll
 end
 ```
 
 ### Encode tree for CTMC models
 
 ```{julia}
-# Build postorder edge list from the Phylo tree
+# Build postorder edge list from the Phylo tree.
+# Tips are assigned node indices 1..n_tips (in the order of `taxa`),
+# internal nodes get indices n_tips+1..n_nodes, and the root index is returned.
 function tree_to_edge_arrays(tree::RootedTree, taxa::Vector{String})
     root_name = getroot(tree).name
-    parents = Int[]
-    children = Int[]
-    lengths = Float64[]
+    n_tips    = length(taxa)
 
-    all_nodes = sort!(unique([n.name for n in traversal(tree, preorder)]))
-    node_idx = Dict(n => i for (i, n) in enumerate(all_nodes))
+    # Assign tip indices 1..n_tips first, then internal nodes
+    node_idx = Dict{String,Int}()
+    for (i, t) in enumerate(taxa)
+        node_idx[t] = i
+    end
+    next_idx = n_tips + 1
+    for nd in traversal(tree, preorder)
+        if !haskey(node_idx, nd.name)
+            node_idx[nd.name] = next_idx
+            next_idx += 1
+        end
+    end
+
     root_node = node_idx[root_name]
-    n_nodes = length(all_nodes)
-    n_tips = length(taxa)
+    n_nodes   = length(node_idx)
+
+    parents  = Int[]
+    children = Int[]
+    lengths  = Float64[]
 
     for nd in traversal(tree, postorder)
         if !isroot(tree, nd)
             mother = getparent(tree, nd)
-            br = getinbound(tree, nd)
-            bl = getlength(tree, br)
-            push!(parents, node_idx[mother.name])
+            br     = getinbound(tree, nd)
+            bl     = getlength(tree, br)
+            push!(parents,  node_idx[mother.name])
             push!(children, node_idx[nd.name])
-            push!(lengths, bl)
+            push!(lengths,  bl)
         end
     end
 
-    tip_node_indices = [node_idx[t] for t in taxa]
-    (parents=parents, children=children, lengths=lengths,
-     root_node=root_node, n_nodes=n_nodes,
-     tip_node_indices=tip_node_indices, node_idx=node_idx)
+    edges = [parents children]
+
+    (edges=edges, lengths=lengths,
+     root_node=root_node, n_nodes=n_nodes, n_tips=n_tips,
+     node_idx=node_idx)
 end
 
 ctmc_tree = tree_to_edge_arrays(edge_tree, taxa)
 println("Root node index: ", ctmc_tree.root_node)
-println("Number of edges: ", length(ctmc_tree.lengths))
+println("Number of edges: ", size(ctmc_tree.edges, 1))
+println("Number of tips:  ", ctmc_tree.n_tips)
 ```
 
 ```{julia}
 # Encode observed tip states as joint (x,y) -> 1..4
+# State encoding: state = 2x + y + 1
+#   (x=0,y=0) -> 1,  (x=0,y=1) -> 2,  (x=1,y=0) -> 3,  (x=1,y=1) -> 4
 tip_states_obs = 2 .* d.x .+ d.y .+ 1  # 1-based
 println("Observed state distribution: ", countmap(tip_states_obs))
 ```
 
 ### Independent CTMC model
 
-Under independence, the four off-diagonal rates satisfy:
-- $q_{(0,0)\to(0,1)} = q_{(1,0)\to(1,1)}$ and $q_{(0,1)\to(0,0)} = q_{(1,1)\to(1,0)}$ (y transitions same regardless of x)
-- $q_{(0,0)\to(1,0)} = q_{(0,1)\to(1,1)}$ and $q_{(1,0)\to(0,0)} = q_{(1,1)\to(0,1)}$ (x transitions same regardless of y)
-
-This gives 4 free relative rates.
+Under independence, the joint process on $(x, y)$ factorizes: the rate of transitioning in $x$ does not depend on the current value of $y$, and vice versa. This imposes four equality constraints on the 8 off-diagonal rates, leaving 4 free parameters. Using the `rates_to_Q` helper, the independent model is parameterized by 4 log-rates with a Normal(0,1) prior — equivalently a LogNormal(0,1) prior on the raw rates.
 
 ```{julia}
 @model function ctmc_independent(tip_states, ctmc_tree)
-    rel_rates ~ Dirichlet(4, 1.0)
-    total_rate ~ LogNormal(-1.0, 0.5)
+    # Normal(0,1) prior on log-rates ↔ LogNormal(0,1) on rates
+    # 4 rates for the independent model: q01, q02, q13, q23 (upper triangle)
+    # plus their reverses q10, q20, q31, q32 (lower triangle)
+    # Independence constraint: rates share values across x-marginal and y-marginal.
+    # We parameterize via 4 free log-rates and enforce the constraint when building Q.
+    log_r ~ MvNormal(zeros(4), I)
 
-    # Build Q matrix under independence constraint
-    Q = zeros(4, 4)
-    Q[1, 2] = total_rate * rel_rates[1]   # (0,0) -> (0,1)
-    Q[2, 1] = total_rate * rel_rates[2]   # (0,1) -> (0,0)
-    Q[1, 3] = total_rate * rel_rates[3]   # (0,0) -> (1,0)
-    Q[3, 1] = total_rate * rel_rates[4]   # (1,0) -> (0,0)
-    Q[2, 4] = total_rate * rel_rates[3]   # (0,1) -> (1,1)  [same rate as (0,0)->(1,0)]
-    Q[4, 2] = total_rate * rel_rates[4]   # (1,1) -> (0,1)  [same rate as (1,0)->(0,0)]
-    Q[3, 4] = total_rate * rel_rates[1]   # (1,0) -> (1,1)  [same rate as (0,0)->(0,1)]
-    Q[4, 3] = total_rate * rel_rates[2]   # (1,1) -> (1,0)  [same rate as (0,1)->(0,0)]
+    # Clamp to [-8, 8] (rates ≈ 0.0003–3000/myr) for numerical stability in expm
+    lr = clamp.(log_r, -8.0, 8.0)
+
+    # Independent model: 8 off-diagonal rates, but only 4 are free.
+    # Rate layout (row-major upper then lower for 4×4):
+    #   upper: q12=lr[1], q13=lr[2], q24=lr[3], q34=lr[4]
+    #   lower: q21=lr[?], q31=lr[?], q42=lr[?], q43=lr[?]
+    # Independence: q12=q34, q21=q43, q13=q24, q31=q42
+    # (y-transition rates independent of x; x-transition rates independent of y)
+    q_y0 = exp(lr[1])   # (x,0)->(x,1): same for x=0 and x=1
+    q_y1 = exp(lr[2])   # (x,1)->(x,0): same for x=0 and x=1
+    q_x0 = exp(lr[3])   # (0,y)->(1,y): same for y=0 and y=1
+    q_x1 = exp(lr[4])   # (1,y)->(0,y): same for y=0 and y=1
+
+    Q = zeros(eltype(lr), 4, 4)
+    # States: 1=(0,0), 2=(0,1), 3=(1,0), 4=(1,1)
+    Q[1, 2] = q_y0   # (0,0)->(0,1)
+    Q[2, 1] = q_y1   # (0,1)->(0,0)
+    Q[3, 4] = q_y0   # (1,0)->(1,1)  [same as (0,0)->(0,1)]
+    Q[4, 3] = q_y1   # (1,1)->(1,0)  [same as (0,1)->(0,0)]
+    Q[1, 3] = q_x0   # (0,0)->(1,0)
+    Q[3, 1] = q_x1   # (1,0)->(0,0)
+    Q[2, 4] = q_x0   # (0,1)->(1,1)  [same as (0,0)->(1,0)]
+    Q[4, 2] = q_x1   # (1,1)->(0,1)  [same as (1,0)->(0,0)]
     for i in 1:4
         Q[i, i] = -sum(Q[i, :])
     end
 
-    ll = felsenstein_pruning(
-        Q,
-        ctmc_tree.parents,
-        ctmc_tree.children,
-        ctmc_tree.lengths,
+    stat = stationary_dist(Q)
+
+    ll = pruning_loglik(
         tip_states,
-        ctmc_tree.n_nodes,
+        ctmc_tree.edges,
+        ctmc_tree.lengths,
         ctmc_tree.root_node,
-        length(tip_states)
+        ctmc_tree.n_nodes,
+        ctmc_tree.n_tips,
+        Q,
+        stat
     )
     Turing.@addlogprob! ll
 end
@@ -575,12 +682,10 @@ end
 Random.seed!(42)
 chain_ctmc_indep = Turing.sample(
     ctmc_independent(tip_states_obs, ctmc_tree),
-    MH(),
+    NUTS(0.65),
     MCMCThreads(),
-    50_000,
-    4;
-    num_warmup=10_000,
-    thinning=10
+    1_000,
+    4
 )
 describe(chain_ctmc_indep)
 ```
@@ -589,14 +694,8 @@ describe(chain_ctmc_indep)
 # Bridge sampling for marginal likelihood
 model_ctmc_indep = ctmc_independent(tip_states_obs, ctmc_tree)
 ldf_ctmc_indep = LogDensityFunction(model_ctmc_indep)
-params_ci = Symbol.(keys(ldf_ctmc_indep.varinfo))
-params_1d_ci = String[]
-chain_names_ci = names(chain_ctmc_indep)
-for pm in params_ci
-    append!(params_1d_ci,
-        [String(x) for x in chain_names_ci if occursin(string(pm), string(x))])
-end
-samples_ci = Array(chain_ctmc_indep[:, Symbol.(params_1d_ci), :])
+param_names_ci = [String(k) for k in keys(DynamicPPL.VarInfo(model_ctmc_indep))]
+samples_ci = Array(chain_ctmc_indep[:, Symbol.(param_names_ci), :])
 f_ci(x) = LogDensityProblems.logdensity(ldf_ctmc_indep, x)
 logml_ctmc_indep = bridge_sampling(samples_ci, f_ci)
 println("Log marginal likelihood (CTMC independent): ", logml_ctmc_indep)
@@ -604,35 +703,32 @@ println("Log marginal likelihood (CTMC independent): ", logml_ctmc_indep)
 
 ### Dependent CTMC model
 
-Under the dependent model, all 8 off-diagonal rates are free.
+Under the dependent model, all 8 off-diagonal rates are free. We use the same `rates_to_Q` helper with 8 log-rates (Normal(0,1) prior), and the same pruning algorithm. The only difference is the prior is over 8 parameters rather than 4.
 
 ```{julia}
 @model function ctmc_dependent(tip_states, ctmc_tree)
-    rel_rates ~ Dirichlet(8, 1.0)
-    total_rate ~ LogNormal(-1.0, 0.5)
+    # 8 free log-rates, Normal(0,1) prior ↔ LogNormal(0,1) on rates
+    log_r ~ MvNormal(zeros(8), I)
 
-    Q = zeros(4, 4)
-    Q[1, 2] = total_rate * rel_rates[1]
-    Q[2, 1] = total_rate * rel_rates[2]
-    Q[1, 3] = total_rate * rel_rates[3]
-    Q[3, 1] = total_rate * rel_rates[4]
-    Q[2, 4] = total_rate * rel_rates[5]
-    Q[4, 2] = total_rate * rel_rates[6]
-    Q[3, 4] = total_rate * rel_rates[7]
-    Q[4, 3] = total_rate * rel_rates[8]
-    for i in 1:4
-        Q[i, i] = -sum(Q[i, :])
-    end
+    # Clamp to [-8, 8] for numerical stability
+    lr    = clamp.(log_r, -8.0, 8.0)
+    rates = exp.(lr)
 
-    ll = felsenstein_pruning(
-        Q,
-        ctmc_tree.parents,
-        ctmc_tree.children,
-        ctmc_tree.lengths,
+    # rates_to_Q fills upper triangle then lower triangle, row-major:
+    # upper: r[1]=(0,0)→(0,1), r[2]=(0,0)→(1,0), r[3]=(0,1)→(1,1), r[4]=(1,0)→(1,1)
+    # lower: r[5]=(0,1)→(0,0), r[6]=(1,0)→(0,0), r[7]=(1,1)→(0,1), r[8]=(1,1)→(1,0)
+    Q    = rates_to_Q(rates, 4)
+    stat = stationary_dist(Q)
+
+    ll = pruning_loglik(
         tip_states,
-        ctmc_tree.n_nodes,
+        ctmc_tree.edges,
+        ctmc_tree.lengths,
         ctmc_tree.root_node,
-        length(tip_states)
+        ctmc_tree.n_nodes,
+        ctmc_tree.n_tips,
+        Q,
+        stat
     )
     Turing.@addlogprob! ll
 end
@@ -642,12 +738,10 @@ end
 Random.seed!(42)
 chain_ctmc_dep = Turing.sample(
     ctmc_dependent(tip_states_obs, ctmc_tree),
-    MH(),
+    NUTS(0.65),
     MCMCThreads(),
-    50_000,
-    4;
-    num_warmup=10_000,
-    thinning=10
+    1_000,
+    4
 )
 describe(chain_ctmc_dep)
 ```
@@ -655,14 +749,8 @@ describe(chain_ctmc_dep)
 ```{julia}
 model_ctmc_dep = ctmc_dependent(tip_states_obs, ctmc_tree)
 ldf_ctmc_dep = LogDensityFunction(model_ctmc_dep)
-params_cd = Symbol.(keys(ldf_ctmc_dep.varinfo))
-params_1d_cd = String[]
-chain_names_cd = names(chain_ctmc_dep)
-for pm in params_cd
-    append!(params_1d_cd,
-        [String(x) for x in chain_names_cd if occursin(string(pm), string(x))])
-end
-samples_cd = Array(chain_ctmc_dep[:, Symbol.(params_1d_cd), :])
+param_names_cd = [String(k) for k in keys(DynamicPPL.VarInfo(model_ctmc_dep))]
+samples_cd = Array(chain_ctmc_dep[:, Symbol.(param_names_cd), :])
 f_cd(x) = LogDensityProblems.logdensity(ldf_ctmc_dep, x)
 logml_ctmc_dep = bridge_sampling(samples_cd, f_cd)
 println("Log marginal likelihood (CTMC dependent): ", logml_ctmc_dep)
