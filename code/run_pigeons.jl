@@ -64,20 +64,17 @@ R"""
 .pruned <- drop.tip(.full_tree, setdiff(.full_tree$tip.label, $keep_langs))
 .pruned <- reorder(.pruned, "postorder")
 .tip_labels  <- .pruned$tip.label
-.edge_matrix <- .pruned$edge
-.edge_lengths <- .pruned$edge.length
-.n_edges <- nrow(.pruned$edge)
+.newick_str  <- write.tree(.pruned)
 """
 
-taxa = rcopy(R".tip_labels")
-edge_matrix  = rcopy(R"as.integer(.edge_matrix)")
-edge_lengths = rcopy(R".edge_lengths")
-n_taxa = length(taxa)
-n_nodes_tree = maximum(edge_matrix)
-edge_mat = reshape(edge_matrix, :, 2)
+taxa_ordered = rcopy(R"as.character(.tip_labels)")
+newick_str   = rcopy(R".newick_str")
+edge_tree    = parsenewick(newick_str)
 
-newick_str = rcopy(R"write.tree(.pruned)")
-edge_tree  = readnwk(IOBuffer(newick_str), RootedTree)
+# Reorder d to match the tip order in the pruned tree
+idx  = indexin(taxa_ordered, d.Language_ID)
+d    = d[idx, :]
+taxa = taxa_ordered
 
 # ─── Tree helper functions ────────────────────────────────────────────────────
 
