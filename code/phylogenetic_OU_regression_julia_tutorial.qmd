@@ -669,9 +669,15 @@ Under independence, the joint process on $(x, y)$ factorizes: the rate of transi
         Q[i, i] = -sum(Q[i, :])
     end
 
-    stat = stationary_dist(Q)
+    stat = try
+        stationary_dist(Q)
+    catch
+        Turing.@addlogprob! -Inf
+        return
+    end
 
-    ll = pruning_loglik(
+    ll = try
+        pruning_loglik(
         tip_states,
         ctmc_tree.edges,
         ctmc_tree.lengths,
@@ -680,7 +686,10 @@ Under independence, the joint process on $(x, y)$ factorizes: the rate of transi
         ctmc_tree.n_tips,
         Q,
         stat
-    )
+        )
+    catch
+        -Inf
+    end
     Turing.@addlogprob! ll
 end
 ```
@@ -725,9 +734,15 @@ Under the dependent model, all 8 off-diagonal rates are free. We use the same `r
     # upper: r[1]=(0,0)→(0,1), r[2]=(0,0)→(1,0), r[3]=(0,1)→(1,1), r[4]=(1,0)→(1,1)
     # lower: r[5]=(0,1)→(0,0), r[6]=(1,0)→(0,0), r[7]=(1,1)→(0,1), r[8]=(1,1)→(1,0)
     Q    = rates_to_Q(rates, 4)
-    stat = stationary_dist(Q)
+    stat = try
+        stationary_dist(Q)
+    catch
+        Turing.@addlogprob! -Inf
+        return
+    end
 
-    ll = pruning_loglik(
+    ll = try
+        pruning_loglik(
         tip_states,
         ctmc_tree.edges,
         ctmc_tree.lengths,
@@ -736,7 +751,10 @@ Under the dependent model, all 8 off-diagonal rates are free. We use the same `r
         ctmc_tree.n_tips,
         Q,
         stat
-    )
+        )
+    catch
+        -Inf
+    end
     Turing.@addlogprob! ll
 end
 ```
