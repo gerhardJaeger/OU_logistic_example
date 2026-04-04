@@ -12,7 +12,7 @@ function bridge_sampling(
       tol1 = 1e-10
       n_post = size(samples_4_iter, 2)
       m = vec(mapslices(mean, samples_4_fit, dims = 2))::Vector{Float64}
-      V = diagm(ones(size(samples, 2)))
+      V = Symmetric(cov(samples_4_fit'))
       q11 = Vector{Float64}(undef, n_post) # unnormalized posterior
       for i = 1:n_post
             q11[i] = log_density(Array(samples_4_iter[:, i]))

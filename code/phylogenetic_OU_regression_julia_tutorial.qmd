@@ -946,14 +946,47 @@ plot(chain_OU_regression[:, [:alpha, :beta, :mu, :sigma, :lambda], :], size=(700
 ```
 
 ```{julia}
-# LOO log-likelihoods
-x_c = d.x .- mean(d.x)
-loglik_OU_regression = hcat([begin
-    eta = Array(chain_OU_regression[:, :alpha, :]) .+
-          Array(chain_OU_regression[:, :beta, :]) .* x_c[i]
-    # Note: z values are deterministic given z_std, but we use the posterior samples directly
-    logpdf.(BernoulliLogit.(eta), d.y[i])
-end for i in 1:nrow(d)]...)
+# LOO log-likelihoods: reconstruct z from z_std + OU parameters
+x_c_loo = d.x .- mean(d.x)
+N_loo = nrow(d)
+n_nodes_loo = length(tree_info.nodes_dict)
+
+get_s(nm) = vec(Array(chain_OU_regression[:, nm, :]))
+
+alpha_s  = get_s("alpha")
+beta_s   = get_s("beta")
+mu_s     = get_s("mu")
+sigma_s  = get_s("sigma")
+lambda_s = get_s("lambda")
+z_std_s  = hcat([get_s("z_std[$j]") for j in 1:n_nodes_loo]...)
+
+n_samples_our = length(alpha_s)
+loglik_OU_regression = zeros(n_samples_our, N_loo)
+
+root_idx_our = tree_info.nodes_dict[tree_info.root]
+n_edges_our  = length(tree_info.mothers)
+dgt_idx_our  = [tree_info.nodes_dict[tree_info.daughters[i]] for i in 1:n_edges_our]
+mth_idx_our  = [tree_info.nodes_dict[tree_info.mothers[i]]   for i in 1:n_edges_our]
+taxa_idx_our = [tree_info.nodes_dict[t] for t in taxa]
+
+for s in 1:n_samples_our
+    σ = sigma_s[s]; λ = lambda_s[s]; μ = mu_s[s]
+    α = alpha_s[s]; β = beta_s[s]
+
+    z_ou = zeros(n_nodes_loo)
+    z_ou[root_idx_our] = μ + (σ / sqrt(2λ)) * z_std_s[s, root_idx_our]
+    for i in n_edges_our:-1:1
+        len = tree_info.lengths[i]
+        decay = exp(-λ * len)
+        s_val = σ * sqrt(-expm1(-2λ * len) / (2λ))
+        z_ou[dgt_idx_our[i]] = μ + (z_ou[mth_idx_our[i]] - μ) * decay + s_val * z_std_s[s, dgt_idx_our[i]]
+    end
+
+    for k in 1:N_loo
+        eta = α + β * x_c_loo[k] + z_ou[taxa_idx_our[k]]
+        loglik_OU_regression[s, k] = logpdf(BernoulliLogit(eta), d.y[k])
+    end
+end
 
 loo_OU_regression = convert(
     Dict,
