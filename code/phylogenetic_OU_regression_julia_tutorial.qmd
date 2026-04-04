@@ -296,9 +296,9 @@ We use bridge sampling to estimate the log marginal likelihood. This requires ex
 ```{julia}
 model_vanilla_regression = vanilla_regression(x_centered, d.y)
 ldf_vanilla_regression = LogDensityFunction(model_vanilla_regression)
-param_names_vr = [String(k) for k in keys(DynamicPPL.VarInfo(model_vanilla_regression))]
+param_names_vr = names(chain_vanilla_regression, :parameters)
 
-samples_vr = Array(chain_vanilla_regression[:, Symbol.(param_names_vr), :])
+samples_vr = Array(chain_vanilla_regression[:, param_names_vr, :])
 f_vr(x) = LogDensityProblems.logdensity(ldf_vanilla_regression, x)
 
 logml_vanilla_regression = bridge_sampling(samples_vr, f_vr)
@@ -710,8 +710,8 @@ describe(chain_ctmc_indep)
 # Bridge sampling for marginal likelihood
 model_ctmc_indep = ctmc_independent(tip_states_obs, ctmc_tree)
 ldf_ctmc_indep = LogDensityFunction(model_ctmc_indep)
-param_names_ci = [String(k) for k in keys(DynamicPPL.VarInfo(model_ctmc_indep))]
-samples_ci = Array(chain_ctmc_indep[:, Symbol.(param_names_ci), :])
+param_names_ci = names(chain_ctmc_indep, :parameters)
+samples_ci = Array(chain_ctmc_indep[:, param_names_ci, :])
 f_ci(x) = LogDensityProblems.logdensity(ldf_ctmc_indep, x)
 logml_ctmc_indep = bridge_sampling(samples_ci, f_ci)
 println("Log marginal likelihood (CTMC independent): ", logml_ctmc_indep)
@@ -774,8 +774,8 @@ describe(chain_ctmc_dep)
 ```{julia}
 model_ctmc_dep = ctmc_dependent(tip_states_obs, ctmc_tree)
 ldf_ctmc_dep = LogDensityFunction(model_ctmc_dep)
-param_names_cd = [String(k) for k in keys(DynamicPPL.VarInfo(model_ctmc_dep))]
-samples_cd = Array(chain_ctmc_dep[:, Symbol.(param_names_cd), :])
+param_names_cd = names(chain_ctmc_dep, :parameters)
+samples_cd = Array(chain_ctmc_dep[:, param_names_cd, :])
 f_cd(x) = LogDensityProblems.logdensity(ldf_ctmc_dep, x)
 logml_ctmc_dep = bridge_sampling(samples_cd, f_cd)
 println("Log marginal likelihood (CTMC dependent): ", logml_ctmc_dep)
