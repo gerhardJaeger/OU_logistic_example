@@ -6,8 +6,6 @@
 #   julia --project=. run_pigeons.jl
 
 cd(@__DIR__)
-using Pkg
-Pkg.activate(".")
 
 using CSV
 using DataFrames
