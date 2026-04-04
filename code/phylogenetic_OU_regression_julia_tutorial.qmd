@@ -1,7 +1,7 @@
 ---
 title: "Phylogenetic OU Regression — Julia/Turing Tutorial"
 format: html
-jupyter: julia-1.11
+jupyter: julia-1.12
 ---
 
 # Running a Phylogenetic OU Regression with Julia and Turing.jl
@@ -79,24 +79,21 @@ if !isfile(tree_file)
     rm(tree_gz)
 end
 
-edge_tree = open(tree_file) do f
-    readnex(f)
-end
+# The MCC tree is a BEAST-annotated Nexus file; use ape via RCall to read it.
+# ape::read.nexus handles the BEAST annotations that parsenewick cannot parse.
+R"""
+library(ape)
+.full_tree <- read.nexus($tree_file)
+.full_tree$tip.label <- sapply(strsplit(.full_tree$tip.label, "_"), `[`, 1)
+.full_tree$edge.length <- .full_tree$edge.length / mean(.full_tree$edge.length)
+"""
 
-# Strip the language-family suffix from tip labels
-for tip in getleaves(edge_tree)
-    tip.name = split(tip.name, "_")[1]
-end
+# All tip labels of the full tree (needed for Grambank filtering below)
+all_tip_labels = rcopy(R"as.character(.full_tree$tip.label)")
+println("Full tree loaded: ", length(all_tip_labels), " tips")
 ```
 
-It is advisable to rescale the tree so that the mean branch length is 1.
-
-```{julia}
-mean_bl = mean(b.length for b in getbranches(edge_tree))
-for b in getbranches(edge_tree)
-    b.length /= mean_bl
-end
-```
+It is advisable to rescale the tree so that the mean branch length is 1. This is already done in R above.
 
 ## Grambank data
 
@@ -122,7 +119,7 @@ vals = CSV.read(grambank_file, DataFrame)
 Now we filter to the two parameters of interest and the languages in the tree.
 
 ```{julia}
-tip_names = Set(getleafnames(edge_tree))
+tip_names = Set(all_tip_labels)
 
 d = @pipe vals |>
     filter(r -> r.Language_ID ∈ tip_names, _) |>
@@ -140,43 +137,53 @@ d[!, :x] = d.GB193 .- 1
 d[!, :y] = d.GB133
 ```
 
-Now we prune the tree to only include the languages in the data.
-
-```{julia}
-droptips!(edge_tree, setdiff(getleafnames(edge_tree), d.Language_ID))
-taxa = sort(getleafnames(edge_tree))
-
-# Reorder d to match the tip order
-idx = indexin(taxa, d.Language_ID)
-d = d[idx, :]
-```
-
-For now, we keep the data set small and restrict ourselves to 100 taxa.
+For now, we keep the data set small and restrict ourselves to 100 taxa. We then prune the
+tree in R using `ape::drop.tip`, export as a Newick string, and re-read with `parsenewick`.
+We also extract the tip labels, edge matrix, edge lengths, and patristic distance matrix
+from the pruned ape tree object.
 
 ```{julia}
 if isfile("../data/grambank_vals_pruned.csv")
     d = CSV.read("../data/grambank_vals_pruned.csv", DataFrame)
-    taxa = sort(d.Language_ID)
-    droptips!(edge_tree, setdiff(getleafnames(edge_tree), taxa))
-    taxa_ordered = getleafnames(edge_tree)
-    idx = indexin(taxa_ordered, d.Language_ID)
-    d = d[idx, :]
-    taxa = taxa_ordered
 else
     Random.seed!(123)
     sample_idx = sort(sample(1:nrow(d), 100; replace=false))
     d = d[sample_idx, :]
-    droptips!(edge_tree, setdiff(getleafnames(edge_tree), d.Language_ID))
-    taxa_ordered = getleafnames(edge_tree)
-    idx = indexin(taxa_ordered, d.Language_ID)
-    d = d[idx, :]
-    taxa = taxa_ordered
     CSV.write("../data/grambank_vals_pruned.csv", d)
 end
+
+# Prune tree in R to only the languages in d, then roundtrip via Newick
+keep_langs = d.Language_ID
+R"""
+.pruned <- drop.tip(.full_tree, setdiff(.full_tree$tip.label, $keep_langs))
+.pruned <- reorder(.pruned, "postorder")
+.tip_labels  <- .pruned$tip.label
+.edge_matrix <- .pruned$edge
+.edge_lengths <- .pruned$edge.length
+.dist_matrix <- cophenetic.phylo(.pruned)
+.newick_str  <- write.tree(.pruned)
+"""
+
+# Pull extracted tree data into Julia
+tip_labels_r  = rcopy(R"as.character(.tip_labels)")
+edge_matrix_r = rcopy(R"matrix(as.integer(.edge_matrix), ncol=2)")
+edge_lengths_r = rcopy(R"as.numeric(.edge_lengths)")
+dist_matrix_r  = rcopy(R"as.matrix(.dist_matrix)")
+newick_str     = rcopy(R".newick_str")
+
+# Build a Phylo.jl RootedTree from the Newick string so downstream code is unchanged
+edge_tree = parsenewick(newick_str)
+
+# Reorder d to match the tip order in the pruned tree
+taxa_ordered = tip_labels_r
+idx = indexin(taxa_ordered, d.Language_ID)
+d = d[idx, :]
+taxa = taxa_ordered
 
 println("Number of languages: ", nrow(d))
 println("Prevalence of x=1: ", mean(d.x))
 println("Prevalence of y=1: ", mean(d.y))
+println("Number of tree tips: ", nleaves(edge_tree))
 ```
 
 ## Tree decomposition helpers
