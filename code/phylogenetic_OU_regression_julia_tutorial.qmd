@@ -1092,12 +1092,10 @@ end
 Random.seed!(42)
 chain_OU_correlation = Turing.sample(
     OU_correlation_single_tree(tree_info, taxa, d.x, d.y),
-    MH(),
+    NUTS(0.65),
     MCMCThreads(),
-    100_000,
-    4;
-    num_warmup=50_000,
-    thinning=10
+    1_000,
+    4
 )
 
 nms_ouc = [nm for nm in names(chain_OU_correlation)
@@ -1219,12 +1217,10 @@ end
 Random.seed!(42)
 chain_brownian_correlation = Turing.sample(
     brownian_correlation_single(nrow(d), scaled_chol) | (x=d.x, y=d.y),
-    MH(),
+    NUTS(0.65),
     MCMCThreads(),
-    100_000,
-    4;
-    num_warmup=50_000,
-    thinning=10
+    1_000,
+    4
 )
 
 nms_bc = [nm for nm in names(chain_brownian_correlation)
