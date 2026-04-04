@@ -1126,11 +1126,15 @@ prior_chain_ouc = Turing.sample(
     length(chain_OU_correlation)
 )
 
-x_prior_ouc = Int.(hcat([prior_chain_ouc[:, "x[$i]", :] for i in 1:nrow(d)]...))
-y_prior_ouc = Int.(hcat([prior_chain_ouc[:, "y[$i]", :] for i in 1:nrow(d)]...))
-
-# Build node name list in taxa order for z extraction
-z_tip_node_names = ["z[$(tree_info.nodes_dict[t]), 1]" for t in taxa]
+# x and y are observed — draw prior predictive from z logits
+x_prior_ouc = hcat([
+    rand.(BernoulliLogit.(vec(Array(prior_chain_ouc[:, "z[$(tree_info.nodes_dict[t]), 1]", :]))))
+    for t in taxa
+]...)
+y_prior_ouc = hcat([
+    rand.(BernoulliLogit.(vec(Array(prior_chain_ouc[:, "z[$(tree_info.nodes_dict[t]), 2]", :]))))
+    for t in taxa
+]...)
 
 x_post_ouc = hcat([
     rand.(BernoulliLogit.(chain_OU_correlation[:, "z[$(tree_info.nodes_dict[t]), 1]", :]))
