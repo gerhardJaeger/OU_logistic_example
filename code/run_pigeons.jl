@@ -312,19 +312,17 @@ end
 
 # ─── Pigeons stepping-stone ───────────────────────────────────────────────────
 
-function pigeons_logml(model, cache_file;
-        n_rounds=12, n_chains=10, explorer=SliceSampler())
+function pigeons_logml(model, cache_file; n_rounds=10, n_chains=5)
     if isfile(cache_file)
         logml = load(cache_file, "logml")
         println("  [cache] ", cache_file, " -> ", round(logml, digits=3))
         return logml
     end
-    println("  Running Pigeons: n_rounds=$(n_rounds), n_chains=$(n_chains), explorer=$(typeof(explorer))...")
+    println("  Running Pigeons: n_rounds=$(n_rounds), n_chains=$(n_chains)...")
     pt = pigeons(
         target   = TuringLogPotential(model),
         n_rounds = n_rounds,
         n_chains = n_chains,
-        explorer = explorer,
     )
     logml = stepping_stone(pt)
     mkpath("cache")
@@ -335,54 +333,49 @@ end
 
 println("\n=== Pigeons stepping-stone log marginal likelihoods ===\n")
 
-println("1. Vanilla regression (small model, n_rounds=10, n_chains=10, SliceSampler)")
+println("1. Vanilla regression (n_rounds=10, n_chains=10)")
 lg_vr = pigeons_logml(
     vanilla_regression(x_centered, d.y),
     "cache/pigeons_vanilla_regression.jld2"; n_rounds=10, n_chains=10)
 
-println("\n2. Vanilla correlation (n_rounds=12, n_chains=10, AutoMALA)")
+println("\n2. Vanilla correlation (n_rounds=10, n_chains=5)")
 lg_vc = pigeons_logml(
     vanilla_correlation(nrow(d)) | (x=d.x, y=d.y),
-    "cache/pigeons_vanilla_correlation.jld2";
-    n_rounds=12, n_chains=10, explorer=AutoMALA())
+    "cache/pigeons_vanilla_correlation.jld2")
 
-println("\n3. CTMC independent (n_rounds=10, n_chains=10, SliceSampler)")
+println("\n3. CTMC independent (n_rounds=10, n_chains=10)")
 lg_ci = pigeons_logml(
     ctmc_independent(tip_states_obs, ctmc_tree),
     "cache/pigeons_ctmc_indep.jld2"; n_rounds=10, n_chains=10)
 
-println("\n4. CTMC dependent (n_rounds=10, n_chains=10, SliceSampler)")
+println("\n4. CTMC dependent (n_rounds=10, n_chains=10)")
 lg_cd = pigeons_logml(
     ctmc_dependent(tip_states_obs, ctmc_tree),
     "cache/pigeons_ctmc_dep.jld2"; n_rounds=10, n_chains=10)
 
 println("   Log BF (indep vs dep): ", lg_ci - lg_cd)
 
-println("\n5. Brownian regression (n_rounds=12, n_chains=10, AutoMALA)")
+println("\n5. Brownian regression (n_rounds=10, n_chains=5)")
 lg_br = pigeons_logml(
     brownian_regression(d, scaled_chol, taxa),
-    "cache/pigeons_brownian_regression.jld2";
-    n_rounds=12, n_chains=10, explorer=AutoMALA())
+    "cache/pigeons_brownian_regression.jld2")
 
-println("\n6. OU regression (n_rounds=12, n_chains=10, AutoMALA)")
+println("\n6. OU regression (n_rounds=10, n_chains=5)")
 lg_or = pigeons_logml(
     OU_regression(d, tree_info, taxa),
-    "cache/pigeons_OU_regression.jld2";
-    n_rounds=12, n_chains=10, explorer=AutoMALA())
+    "cache/pigeons_OU_regression.jld2")
 
 println("   Log BF (OU vs Brownian regression): ", lg_or - lg_br)
 
-println("\n7. Brownian correlation (n_rounds=12, n_chains=10, AutoMALA)")
+println("\n7. Brownian correlation (n_rounds=10, n_chains=5)")
 lg_bc = pigeons_logml(
     brownian_correlation_single(nrow(d), scaled_chol) | (x=d.x, y=d.y),
-    "cache/pigeons_brownian_correlation.jld2";
-    n_rounds=12, n_chains=10, explorer=AutoMALA())
+    "cache/pigeons_brownian_correlation.jld2")
 
-println("\n8. OU correlation (n_rounds=12, n_chains=10, AutoMALA)")
+println("\n8. OU correlation (n_rounds=10, n_chains=5)")
 lg_oc = pigeons_logml(
     OU_correlation_single_tree(tree_info, taxa, d.x, d.y),
-    "cache/pigeons_OU_correlation.jld2";
-    n_rounds=12, n_chains=10, explorer=AutoMALA())
+    "cache/pigeons_OU_correlation.jld2")
 
 println("   Log BF (OU correlation vs OU regression): ", lg_oc - lg_or)
 
