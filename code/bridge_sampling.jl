@@ -14,20 +14,20 @@ function bridge_sampling(
       m = vec(mapslices(mean, samples_4_fit, dims = 2))::Vector{Float64}
       V = diagm(ones(size(samples, 2)))
       q11 = Vector{Float64}(undef, n_post) # unnormalized posterior
-      @threads for i = 1:n_post
+      for i = 1:n_post
             q11[i] = log_density(Array(samples_4_iter[:, i]))
       end
       q12 = Vector{Float64}(undef, n_post) # g
-      @threads for i = 1:n_post
+      for i = 1:n_post
             q12[i] = logpdf(MvNormal(m, V), samples_4_iter[:, i])
       end
       gen_samples = rand(MvNormal(m, V), n_post)
       q21 = Vector{Float64}(undef, n_post) # unnormalized posterior
-      @threads for i = 1:n_post
+      for i = 1:n_post
             q21[i] = log_density(gen_samples[:, i])
       end
       q22 = Vector{Float64}(undef, n_post) # g
-      @threads for i = 1:n_post
+      for i = 1:n_post
             q22[i] = logpdf(MvNormal(m, V), gen_samples[:, i])
       end
       l1 = q11 - q12 # samples_4_iter, unnormalized posterior / g
