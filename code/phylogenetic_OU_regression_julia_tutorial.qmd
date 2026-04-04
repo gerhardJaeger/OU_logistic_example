@@ -51,6 +51,7 @@ using StatsBase
 using StatsFuns
 using StatsPlots
 using Main.Threads
+using JLD2
 using Turing
 gr()
 include("bridge_sampling.jl")
@@ -272,15 +273,24 @@ end
 ```
 
 ```{julia}
-Random.seed!(42)
-chain_vanilla_regression = Turing.sample(
-    vanilla_regression(x_centered, d.y),
-    NUTS(0.65),
-    MCMCThreads(),
-    1_000,
-    4
-)
-describe(chain_vanilla_regression)
+_cache_file = "cache/chain_vanilla_regression.jld2"
+if isfile(_cache_file)
+    chain_vanilla_regression = load(_cache_file, "chain")
+    println("Loaded chain_vanilla_regression from cache")
+else
+    Random.seed!(42)
+    chain_vanilla_regression = Turing.sample(
+        vanilla_regression(x_centered, d.y),
+        NUTS(0.65),
+        MCMCThreads(),
+        1_000,
+        4
+    )
+    describe(chain_vanilla_regression)
+    mkpath("cache")
+    jldsave(_cache_file; chain=chain_vanilla_regression)
+    println("Saved chain_vanilla_regression to cache")
+end
 ```
 
 ```{julia}
@@ -361,18 +371,27 @@ end
 ```
 
 ```{julia}
-Random.seed!(42)
-chain_vanilla_correlation = Turing.sample(
-    vanilla_correlation(nrow(d)) | (x=d.x, y=d.y),
-    NUTS(0.65),
-    MCMCThreads(),
-    1_000,
-    4
-)
-
-nms_vc = [nm for nm in names(chain_vanilla_correlation)
-          if !occursin("z", string(nm)) && !occursin("_u", string(nm))]
-describe(chain_vanilla_correlation[:, nms_vc, :])
+_cache_file = "cache/chain_vanilla_correlation.jld2"
+if isfile(_cache_file)
+    chain_vanilla_correlation = load(_cache_file, "chain")
+    println("Loaded chain_vanilla_correlation from cache")
+else
+    Random.seed!(42)
+    chain_vanilla_correlation = Turing.sample(
+        vanilla_correlation(nrow(d)) | (x=d.x, y=d.y),
+        NUTS(0.65),
+        MCMCThreads(),
+        1_000,
+        4
+    )
+    
+    nms_vc = [nm for nm in names(chain_vanilla_correlation)
+              if !occursin("z", string(nm)) && !occursin("_u", string(nm))]
+    describe(chain_vanilla_correlation[:, nms_vc, :])
+    mkpath("cache")
+    jldsave(_cache_file; chain=chain_vanilla_correlation)
+    println("Saved chain_vanilla_correlation to cache")
+end
 ```
 
 ```{julia}
@@ -695,15 +714,24 @@ end
 ```
 
 ```{julia}
-Random.seed!(42)
-chain_ctmc_indep = Turing.sample(
-    ctmc_independent(tip_states_obs, ctmc_tree),
-    NUTS(0.65),
-    MCMCThreads(),
-    1_000,
-    4
-)
-describe(chain_ctmc_indep)
+_cache_file = "cache/chain_ctmc_indep.jld2"
+if isfile(_cache_file)
+    chain_ctmc_indep = load(_cache_file, "chain")
+    println("Loaded chain_ctmc_indep from cache")
+else
+    Random.seed!(42)
+    chain_ctmc_indep = Turing.sample(
+        ctmc_independent(tip_states_obs, ctmc_tree),
+        NUTS(0.65),
+        MCMCThreads(),
+        1_000,
+        4
+    )
+    describe(chain_ctmc_indep)
+    mkpath("cache")
+    jldsave(_cache_file; chain=chain_ctmc_indep)
+    println("Saved chain_ctmc_indep to cache")
+end
 ```
 
 ```{julia}
@@ -770,15 +798,24 @@ end
 ```
 
 ```{julia}
-Random.seed!(42)
-chain_ctmc_dep = Turing.sample(
-    ctmc_dependent(tip_states_obs, ctmc_tree),
-    NUTS(0.65),
-    MCMCThreads(),
-    1_000,
-    4
-)
-describe(chain_ctmc_dep)
+_cache_file = "cache/chain_ctmc_dep.jld2"
+if isfile(_cache_file)
+    chain_ctmc_dep = load(_cache_file, "chain")
+    println("Loaded chain_ctmc_dep from cache")
+else
+    Random.seed!(42)
+    chain_ctmc_dep = Turing.sample(
+        ctmc_dependent(tip_states_obs, ctmc_tree),
+        NUTS(0.65),
+        MCMCThreads(),
+        1_000,
+        4
+    )
+    describe(chain_ctmc_dep)
+    mkpath("cache")
+    jldsave(_cache_file; chain=chain_ctmc_dep)
+    println("Saved chain_ctmc_dep to cache")
+end
 ```
 
 ```{julia}
@@ -881,18 +918,27 @@ end
 ```
 
 ```{julia}
-Random.seed!(42)
-chain_OU_regression = Turing.sample(
-    OU_regression(d, tree_info, taxa),
-    NUTS(0.95),
-    MCMCThreads(),
-    1_000,
-    4
-)
-
-nms_our = [nm for nm in names(chain_OU_regression)
-           if !occursin("z_std", string(nm)) && !occursin("_u", string(nm))]
-describe(chain_OU_regression[:, nms_our, :])
+_cache_file = "cache/chain_OU_regression.jld2"
+if isfile(_cache_file)
+    chain_OU_regression = load(_cache_file, "chain")
+    println("Loaded chain_OU_regression from cache")
+else
+    Random.seed!(42)
+    chain_OU_regression = Turing.sample(
+        OU_regression(d, tree_info, taxa),
+        NUTS(0.95),
+        MCMCThreads(),
+        1_000,
+        4
+    )
+    
+    nms_our = [nm for nm in names(chain_OU_regression)
+               if !occursin("z_std", string(nm)) && !occursin("_u", string(nm))]
+    describe(chain_OU_regression[:, nms_our, :])
+    mkpath("cache")
+    jldsave(_cache_file; chain=chain_OU_regression)
+    println("Saved chain_OU_regression to cache")
+end
 ```
 
 ```{julia}
@@ -967,18 +1013,27 @@ end
 ```
 
 ```{julia}
-Random.seed!(42)
-chain_brownian_regression = Turing.sample(
-    brownian_regression(d, scaled_chol, taxa),
-    NUTS(0.95),
-    MCMCThreads(),
-    1_000,
-    4
-)
-
-nms_br = [nm for nm in names(chain_brownian_regression)
-          if !occursin("z", string(nm)) && !occursin("_u", string(nm))]
-describe(chain_brownian_regression[:, nms_br, :])
+_cache_file = "cache/chain_brownian_regression.jld2"
+if isfile(_cache_file)
+    chain_brownian_regression = load(_cache_file, "chain")
+    println("Loaded chain_brownian_regression from cache")
+else
+    Random.seed!(42)
+    chain_brownian_regression = Turing.sample(
+        brownian_regression(d, scaled_chol, taxa),
+        NUTS(0.95),
+        MCMCThreads(),
+        1_000,
+        4
+    )
+    
+    nms_br = [nm for nm in names(chain_brownian_regression)
+              if !occursin("z", string(nm)) && !occursin("_u", string(nm))]
+    describe(chain_brownian_regression[:, nms_br, :])
+    mkpath("cache")
+    jldsave(_cache_file; chain=chain_brownian_regression)
+    println("Saved chain_brownian_regression to cache")
+end
 ```
 
 ```{julia}
@@ -1089,19 +1144,28 @@ end
 ```
 
 ```{julia}
-Random.seed!(42)
-chain_OU_correlation = Turing.sample(
-    OU_correlation_single_tree(tree_info, taxa, d.x, d.y),
-    NUTS(0.65),
-    MCMCThreads(),
-    1_000,
-    4
-)
-
-nms_ouc = [nm for nm in names(chain_OU_correlation)
-           if !occursin("z", string(nm)) && !occursin("_u", string(nm)) &&
-              !occursin("root_states", string(nm))]
-describe(chain_OU_correlation[:, nms_ouc, :])
+_cache_file = "cache/chain_OU_correlation.jld2"
+if isfile(_cache_file)
+    chain_OU_correlation = load(_cache_file, "chain")
+    println("Loaded chain_OU_correlation from cache")
+else
+    Random.seed!(42)
+    chain_OU_correlation = Turing.sample(
+        OU_correlation_single_tree(tree_info, taxa, d.x, d.y),
+        NUTS(0.65),
+        MCMCThreads(),
+        1_000,
+        4
+    )
+    
+    nms_ouc = [nm for nm in names(chain_OU_correlation)
+               if !occursin("z", string(nm)) && !occursin("_u", string(nm)) &&
+                  !occursin("root_states", string(nm))]
+    describe(chain_OU_correlation[:, nms_ouc, :])
+    mkpath("cache")
+    jldsave(_cache_file; chain=chain_OU_correlation)
+    println("Saved chain_OU_correlation to cache")
+end
 ```
 
 ```{julia}
@@ -1217,18 +1281,27 @@ end
 ```
 
 ```{julia}
-Random.seed!(42)
-chain_brownian_correlation = Turing.sample(
-    brownian_correlation_single(nrow(d), scaled_chol) | (x=d.x, y=d.y),
-    NUTS(0.65),
-    MCMCThreads(),
-    1_000,
-    4
-)
-
-nms_bc = [nm for nm in names(chain_brownian_correlation)
-          if !occursin("z", string(nm)) && !occursin("_u", string(nm))]
-describe(chain_brownian_correlation[:, nms_bc, :])
+_cache_file = "cache/chain_brownian_correlation.jld2"
+if isfile(_cache_file)
+    chain_brownian_correlation = load(_cache_file, "chain")
+    println("Loaded chain_brownian_correlation from cache")
+else
+    Random.seed!(42)
+    chain_brownian_correlation = Turing.sample(
+        brownian_correlation_single(nrow(d), scaled_chol) | (x=d.x, y=d.y),
+        NUTS(0.65),
+        MCMCThreads(),
+        1_000,
+        4
+    )
+    
+    nms_bc = [nm for nm in names(chain_brownian_correlation)
+              if !occursin("z", string(nm)) && !occursin("_u", string(nm))]
+    describe(chain_brownian_correlation[:, nms_bc, :])
+    mkpath("cache")
+    jldsave(_cache_file; chain=chain_brownian_correlation)
+    println("Saved chain_brownian_correlation to cache")
+end
 ```
 
 ```{julia}
