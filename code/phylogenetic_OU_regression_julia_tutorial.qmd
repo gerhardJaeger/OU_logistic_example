@@ -383,14 +383,14 @@ plot(chain_vanilla_correlation[:, nms_vc, :], size=(700, 600))
 # Prior predictive sampling
 prior_chain_vc = Turing.sample(vanilla_correlation(nrow(d)), Prior(), 1_000)
 prior_cors_vc = filter(!isnan, [cor(
-    Int.(prior_chain_vc[:, "x[$i]", :]),
-    Int.(prior_chain_vc[:, "y[$i]", :])
+    Int.(prior_chain_vc[:, Symbol("x[$i]"), :]),
+    Int.(prior_chain_vc[:, Symbol("y[$i]"), :])
 ) for i in 1:nrow(d)])
 
 # Posterior predictive sampling
 post_cors_vc = filter(!isnan, [cor(
-    rand.(BernoulliLogit.(chain_vanilla_correlation[:, "z[1, $i]", :])),
-    rand.(BernoulliLogit.(chain_vanilla_correlation[:, "z[2, $i]", :]))
+    rand.(BernoulliLogit.(chain_vanilla_correlation[:, Symbol("z[1, $i]"), :])),
+    rand.(BernoulliLogit.(chain_vanilla_correlation[:, Symbol("z[2, $i]"), :]))
 ) for i in 1:nrow(d)])
 
 df_cor_vc = DataFrame(
@@ -406,7 +406,7 @@ vline!([cor(d.x, d.y)], label="observed", color=:red)
 ```{julia}
 # LOO log-likelihoods (y only, to compare with regression)
 loglik_vanilla_correlation_y = hcat([
-    logpdf.(BernoulliLogit.(chain_vanilla_correlation[:, "z[2, $i]", :]), d.y[i])
+    logpdf.(BernoulliLogit.(chain_vanilla_correlation[:, Symbol("z[2, $i]"), :]), d.y[i])
     for i in 1:nrow(d)
 ]...)
 
@@ -984,7 +984,7 @@ describe(chain_brownian_regression[:, nms_br, :])
 ```{julia}
 # LOO and bridge sampling for brownian regression
 loglik_brownian_regression = hcat([begin
-    z_vals = Array(chain_brownian_regression[:, "z[$i]", :])
+    z_vals = Array(chain_brownian_regression[:, Symbol("z[$i]"), :])
     x_c = d.x .- mean(d.x)
     logpdf.(BernoulliLogit.(
         Array(chain_brownian_regression[:, :alpha, :]) .+
@@ -1128,20 +1128,20 @@ prior_chain_ouc = Turing.sample(
 
 # x and y are observed — draw prior predictive from z logits
 x_prior_ouc = hcat([
-    rand.(BernoulliLogit.(vec(Array(prior_chain_ouc[:, "x_logits[$k]", :]))))
+    rand.(BernoulliLogit.(vec(Array(prior_chain_ouc[:, Symbol("x_logits[$k]"), :]))))
     for k in 1:nrow(d)
 ]...)
 y_prior_ouc = hcat([
-    rand.(BernoulliLogit.(vec(Array(prior_chain_ouc[:, "y_logits[$k]", :]))))
+    rand.(BernoulliLogit.(vec(Array(prior_chain_ouc[:, Symbol("y_logits[$k]"), :]))))
     for k in 1:nrow(d)
 ]...)
 
 x_post_ouc = hcat([
-    rand.(BernoulliLogit.(vec(Array(chain_OU_correlation[:, "x_logits[$k]", :]))))
+    rand.(BernoulliLogit.(vec(Array(chain_OU_correlation[:, Symbol("x_logits[$k]"), :]))))
     for k in 1:nrow(d)
 ]...)
 y_post_ouc = hcat([
-    rand.(BernoulliLogit.(vec(Array(chain_OU_correlation[:, "y_logits[$k]", :]))))
+    rand.(BernoulliLogit.(vec(Array(chain_OU_correlation[:, Symbol("y_logits[$k]"), :]))))
     for k in 1:nrow(d)
 ]...)
 
@@ -1163,7 +1163,7 @@ vline!([cor(d.x, d.y)], label="observed", color=:red)
 ```{julia}
 loglik_OU_correlation_y = hcat([
     logpdf.(BernoulliLogit.(
-        chain_OU_correlation[:, "z[$(tree_info.nodes_dict[taxa[i]]), 2]", :]
+        chain_OU_correlation[:, Symbol("z[$(tree_info.nodes_dict[taxa[i]]), 2]"), :]
     ), d.y[i])
     for i in 1:nrow(d)
 ]...)
@@ -1233,7 +1233,7 @@ describe(chain_brownian_correlation[:, nms_bc, :])
 
 ```{julia}
 loglik_brownian_correlation_y = hcat([
-    logpdf.(BernoulliLogit.(chain_brownian_correlation[:, "z[2, $i]", :]), d.y[i])
+    logpdf.(BernoulliLogit.(chain_brownian_correlation[:, Symbol("z[2, $i]"), :]), d.y[i])
     for i in 1:nrow(d)
 ]...)
 
