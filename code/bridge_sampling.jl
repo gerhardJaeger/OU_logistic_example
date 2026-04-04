@@ -1,4 +1,17 @@
 
+# Extract only the stochastic (non-deterministic) parameter samples from a chain,
+# using the LogDensityFunction's VarInfo to determine which parameters are free.
+# This excludes variables tracked with := (deterministic transforms).
+function stochastic_samples(chain, ldf)
+    # Get base symbol names of free parameters from the VarInfo
+    vi_syms = Set(DynamicPPL.getsym(k) for k in keys(ldf.varinfo))
+    # Filter chain :parameters: keep only those whose base name is in vi_syms
+    param_names = filter(names(chain, :parameters)) do nm
+        Symbol(split(string(nm), "[")[1]) in vi_syms
+    end
+    Array(chain[:, param_names, :])
+end
+
 
 function bridge_sampling(
       samples::Array{Float64,2},
@@ -9,10 +22,10 @@ function bridge_sampling(
       samples_4_fit = permutedims(Array(samples[1:nr, :]))
       samples_4_iter = permutedims(Array(samples[(nr+1):end, :]))
       r0 = 0.5
-      tol1 = 1e-10
       n_post = size(samples_4_iter, 2)
+      n_params = size(samples_4_fit, 1)
       m = vec(mapslices(mean, samples_4_fit, dims = 2))::Vector{Float64}
-      V = Symmetric(cov(samples_4_fit'))
+      V = Symmetric(cov(samples_4_fit') + 1e-8 * I(n_params))
       q11 = Vector{Float64}(undef, n_post) # unnormalized posterior
       for i = 1:n_post
             q11[i] = log_density(Array(samples_4_iter[:, i]))
@@ -31,20 +44,13 @@ function bridge_sampling(
             q22[i] = logpdf(MvNormal(m, V), gen_samples[:, i])
       end
       l1 = q11 - q12 # samples_4_iter, unnormalized posterior / g
-      l2 = q21 - q22# gen_samples, unnormalized posterior / g
+      l2 = q21 - q22 # gen_samples, unnormalized posterior / g
       lstar = median(l1)
       n_1 = length(l1)
       n_2 = length(l2)
       neff = (1.0 * n_1)::Float64
-      try
-            neff = minimum(summarystats(sim).value[:, end, 1])
-      catch e
-      end
       s1 = neff ./ (neff .+ n_2)
       s2 = n_2 ./ (neff .+ n_2)
-      logr = log(r0)
-      log_r_vals = [logr]::Vector{Float64}
-      logml = logr + lstar
 
       function upd(logr)
             lognumi = logsumexp([
@@ -58,7 +64,7 @@ function bridge_sampling(
             log(n_1) - log(n_2) + lognumi - logdeni
       end
 
-      ft = optimize(y -> (upd(y)-y)^2, -10000., 0.)
+      ft = optimize(y -> (upd(y)-y)^2, -1e6, 1e6)
       ft.minimizer + lstar
 
 end

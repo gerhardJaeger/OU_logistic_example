@@ -306,9 +306,7 @@ We use bridge sampling to estimate the log marginal likelihood. This requires ex
 ```{julia}
 model_vanilla_regression = vanilla_regression(x_centered, d.y)
 ldf_vanilla_regression = LogDensityFunction(model_vanilla_regression)
-param_names_vr = names(chain_vanilla_regression, :parameters)
-
-samples_vr = Array(chain_vanilla_regression[:, param_names_vr, :])
+samples_vr = stochastic_samples(chain_vanilla_regression, ldf_vanilla_regression)
 f_vr(x) = LogDensityProblems.logdensity(ldf_vanilla_regression, x)
 
 logml_vanilla_regression = bridge_sampling(samples_vr, f_vr)
@@ -439,14 +437,7 @@ println("LOOIC (vanilla correlation): ", loo_vanilla_correlation["looic"])
 ```{julia}
 model_vc = vanilla_correlation(nrow(d)) | (x=d.x, y=d.y)
 ldf_vc = LogDensityFunction(model_vc)
-chain_names_vc = names(chain_vanilla_correlation)
-params_vc = Symbol.(keys(ldf_vc.varinfo))
-params_1d_vc = String[]
-for pm in params_vc
-    append!(params_1d_vc,
-        [String(x) for x in chain_names_vc if occursin(string(pm), string(x))])
-end
-samples_vc = Array(chain_vanilla_correlation[:, Symbol.(params_1d_vc), :])
+samples_vc = stochastic_samples(chain_vanilla_correlation, ldf_vc)
 f_vc(x) = LogDensityProblems.logdensity(ldf_vc, x)
 logml_vanilla_correlation = bridge_sampling(samples_vc, f_vc)
 println("Log marginal likelihood (vanilla correlation): ", logml_vanilla_correlation)
@@ -738,8 +729,7 @@ end
 # Bridge sampling for marginal likelihood
 model_ctmc_indep = ctmc_independent(tip_states_obs, ctmc_tree)
 ldf_ctmc_indep = LogDensityFunction(model_ctmc_indep)
-param_names_ci = names(chain_ctmc_indep, :parameters)
-samples_ci = Array(chain_ctmc_indep[:, param_names_ci, :])
+samples_ci = stochastic_samples(chain_ctmc_indep, ldf_ctmc_indep)
 f_ci(x) = LogDensityProblems.logdensity(ldf_ctmc_indep, x)
 logml_ctmc_indep = bridge_sampling(samples_ci, f_ci)
 println("Log marginal likelihood (CTMC independent): ", logml_ctmc_indep)
@@ -821,8 +811,7 @@ end
 ```{julia}
 model_ctmc_dep = ctmc_dependent(tip_states_obs, ctmc_tree)
 ldf_ctmc_dep = LogDensityFunction(model_ctmc_dep)
-param_names_cd = names(chain_ctmc_dep, :parameters)
-samples_cd = Array(chain_ctmc_dep[:, param_names_cd, :])
+samples_cd = stochastic_samples(chain_ctmc_dep, ldf_ctmc_dep)
 f_cd(x) = LogDensityProblems.logdensity(ldf_ctmc_dep, x)
 logml_ctmc_dep = bridge_sampling(samples_cd, f_cd)
 println("Log marginal likelihood (CTMC dependent): ", logml_ctmc_dep)
@@ -999,14 +988,7 @@ println("LOOIC (OU regression): ", loo_OU_regression["looic"])
 # Bridge sampling
 model_our = OU_regression(d, tree_info, taxa)
 ldf_our = LogDensityFunction(model_our)
-params_our = Symbol.(keys(ldf_our.varinfo))
-params_1d_our = String[]
-chain_names_our = names(chain_OU_regression)
-for pm in params_our
-    append!(params_1d_our,
-        [String(x) for x in chain_names_our if occursin(string(pm), string(x))])
-end
-samples_our = Array(chain_OU_regression[:, Symbol.(params_1d_our), :])
+samples_our = stochastic_samples(chain_OU_regression, ldf_our)
 f_our(x) = LogDensityProblems.logdensity(ldf_our, x)
 logml_OU_regression = bridge_sampling(samples_our, f_our)
 println("Log marginal likelihood (OU regression): ", logml_OU_regression)
@@ -1091,14 +1073,7 @@ println("LOOIC (Brownian regression): ", loo_brownian_regression["looic"])
 ```{julia}
 model_br = brownian_regression(d, scaled_chol, taxa)
 ldf_br = LogDensityFunction(model_br)
-params_br = Symbol.(keys(ldf_br.varinfo))
-params_1d_br = String[]
-chain_names_br = names(chain_brownian_regression)
-for pm in params_br
-    append!(params_1d_br,
-        [String(x) for x in chain_names_br if occursin(string(pm), string(x))])
-end
-samples_br = Array(chain_brownian_regression[:, Symbol.(params_1d_br), :])
+samples_br = stochastic_samples(chain_brownian_regression, ldf_br)
 f_br(x) = LogDensityProblems.logdensity(ldf_br, x)
 logml_brownian_regression = bridge_sampling(samples_br, f_br)
 println("Log marginal likelihood (Brownian regression): ", logml_brownian_regression)
@@ -1273,14 +1248,7 @@ println("LOOIC (OU correlation): ", loo_OU_correlation["looic"])
 ```{julia}
 model_ouc = OU_correlation_single_tree(tree_info, taxa, d.x, d.y)
 ldf_ouc = LogDensityFunction(model_ouc)
-params_ouc = Symbol.(keys(ldf_ouc.varinfo))
-params_1d_ouc = String[]
-chain_names_ouc = names(chain_OU_correlation)
-for pm in params_ouc
-    append!(params_1d_ouc,
-        [String(x) for x in chain_names_ouc if occursin(string(pm), string(x))])
-end
-samples_ouc = Array(chain_OU_correlation[:, Symbol.(params_1d_ouc), :])
+samples_ouc = stochastic_samples(chain_OU_correlation, ldf_ouc)
 f_ouc(x) = LogDensityProblems.logdensity(ldf_ouc, x)
 logml_OU_correlation = bridge_sampling(samples_ouc, f_ouc)
 println("Log marginal likelihood (OU correlation): ", logml_OU_correlation)
@@ -1351,14 +1319,7 @@ println("LOOIC (Brownian correlation): ", loo_brownian_correlation["looic"])
 ```{julia}
 model_bc = brownian_correlation_single(nrow(d), scaled_chol) | (x=d.x, y=d.y)
 ldf_bc = LogDensityFunction(model_bc)
-params_bc = Symbol.(keys(ldf_bc.varinfo))
-params_1d_bc = String[]
-chain_names_bc = names(chain_brownian_correlation)
-for pm in params_bc
-    append!(params_1d_bc,
-        [String(x) for x in chain_names_bc if occursin(string(pm), string(x))])
-end
-samples_bc = Array(chain_brownian_correlation[:, Symbol.(params_1d_bc), :])
+samples_bc = stochastic_samples(chain_brownian_correlation, ldf_bc)
 f_bc(x) = LogDensityProblems.logdensity(ldf_bc, x)
 logml_brownian_correlation = bridge_sampling(samples_bc, f_bc)
 println("Log marginal likelihood (Brownian correlation): ", logml_brownian_correlation)
