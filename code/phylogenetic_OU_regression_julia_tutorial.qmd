@@ -857,7 +857,7 @@ Rather than inverting a covariance matrix, we simulate the OU process node by no
     z_std ~ filldist(Normal(), n_nodes)
 
     # OU process: root
-    z = zeros(Float64, n_nodes)
+    z = zeros(typeof(sigma), n_nodes)
     z[nodes_dict[root]] = mu + (sigma / sqrt(2 * lambda)) * z_std[nodes_dict[root]]
 
     # Propagate from root to tips (reverse postorder = preorder)
@@ -1067,7 +1067,7 @@ We implement this by simulating the bivariate OU process along the tree, using c
 
     # Propagate OU along tree
     n_nodes = length(nodes_dict)
-    z = zeros(Float64, n_nodes, 2)
+    z = zeros(typeof(sigma[1]), n_nodes, 2)
     z[nodes_dict[root], :] .= root_states
 
     for i in length(mothers):-1:1
