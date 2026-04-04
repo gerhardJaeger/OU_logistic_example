@@ -367,27 +367,27 @@ lg_cd = pigeons_logml(
 
 println("   Log BF (indep vs dep): ", lg_ci - lg_cd)
 
-println("\n5. Brownian regression (n_rounds=10, n_chains=5)")
+println("\n5. Brownian regression (n_rounds=8, n_chains=5)")
 lg_br = pigeons_logml(
     brownian_regression(d, scaled_chol, taxa),
-    "cache/pigeons_brownian_regression.jld2")
+    "cache/pigeons_brownian_regression.jld2"; n_rounds=8)
 
-println("\n6. OU regression (n_rounds=10, n_chains=5)")
+println("\n6. OU regression (n_rounds=8, n_chains=5)")
 lg_or = pigeons_logml(
     OU_regression(d, tree_info, taxa),
-    "cache/pigeons_OU_regression.jld2")
+    "cache/pigeons_OU_regression.jld2"; n_rounds=8)
 
 println("   Log BF (OU vs Brownian regression): ", lg_or - lg_br)
 
-println("\n7. Brownian correlation (n_rounds=10, n_chains=5)")
+println("\n7. Brownian correlation (n_rounds=8, n_chains=5)")
 lg_bc = pigeons_logml(
     brownian_correlation_single(nrow(d), scaled_chol) | (x=d.x, y=d.y),
-    "cache/pigeons_brownian_correlation.jld2")
+    "cache/pigeons_brownian_correlation.jld2"; n_rounds=8)
 
-println("\n8. OU correlation (n_rounds=10, n_chains=5)")
+println("\n8. OU correlation (n_rounds=8, n_chains=5)")
 lg_oc = pigeons_logml(
     OU_correlation_single_tree(tree_info, taxa, d.x, d.y),
-    "cache/pigeons_OU_correlation.jld2")
+    "cache/pigeons_OU_correlation.jld2"; n_rounds=8)
 
 println("   Log BF (OU correlation vs OU regression): ", lg_oc - lg_or)
 
