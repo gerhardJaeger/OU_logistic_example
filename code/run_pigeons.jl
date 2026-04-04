@@ -153,10 +153,16 @@ function pruning_loglik(s, edges, edge_lengths, root_node, n_nodes, n_tips, Q, s
     for i in 1:n_tips
         for k in 1:n_states; L[i,k] = (k == s[i]) ? one(eltype(Q)) : zero(eltype(Q)); end
     end
+    # Precompute eigendecomposition once per Q evaluation (avoids 200 full matrix
+    # exponentials; replaces each exp(Q*len) with cheap diagonal exp).
+    F    = eigen(Q)
+    vals = F.values
+    vecs = F.vectors
+    vinv = inv(vecs)
     n_edges = size(edges,1)
     for e in 1:n_edges
         parent = edges[e,1]; child = edges[e,2]; len = edge_lengths[e]
-        P = exp(Q * len)
+        P = real(vecs * Diagonal(exp.(vals * len)) * vinv)
         L[parent,:] .*= P * L[child,:]
     end
     return log(dot(stat, L[root_node,:]))
