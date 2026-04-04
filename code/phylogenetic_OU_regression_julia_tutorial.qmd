@@ -1,0 +1,1227 @@
+---
+title: "Phylogenetic OU Regression — Julia/Turing Tutorial"
+format: html
+jupyter: julia-1.11
+---
+
+# Running a Phylogenetic OU Regression with Julia and Turing.jl
+
+Phylogenetic comparative methods for binary typological features have long relied on two approaches: the continuous-time Markov chain (CTMC) model of Pagel & Meade (2006), which treats features as evolving between discrete states, and Brownian motion random effects, which model continuous phylogenetic drift. Both have shortcomings when applied to typological data. CTMC discards gradient information by forcing evolution into a discrete state space. Brownian motion assumes unbounded drift, yet typological features cluster around cross-linguistic norms rather than diverging without limit — a pattern consistent with stabilizing selection toward typological attractors.
+
+The Ornstein-Uhlenbeck (OU) process directly models this stabilization. It is a Brownian motion with a restoring force toward an attractor, parameterized by a mean-reversion rate $\lambda$. As $\lambda \to 0$ it reduces to Brownian motion; for $\lambda > 0$ it captures the tendency of typological features to remain near cross-linguistic norms regardless of genealogical distance.
+
+This notebook is a Julia/Turing.jl translation of the main R+Stan tutorial. It covers the same sequence of models — from simple baselines through the standard CTMC approach to Brownian and OU phylogenetic models — and compares them via Bayes factors and leave-one-out cross-validation. The OU models consistently outperform the alternatives, both statistically and conceptually.
+
+For multi-tree marginalization (averaging over a posterior sample of 902 EDGE trees), see the companion notebook `phylogenetic_OU_regression_julia.qmd`.
+
+## Preparing the environment
+
+The git repository https://github.com/gerhardJaeger/OU_logistic_example holds the source code for this notebook. It contains a file `OU_logistic_example.yml`. You can use it to set up a conda environment containing all the required packages.
+
+```{julia}
+cd(@__DIR__)
+using Pkg
+Pkg.activate(".")
+Pkg.instantiate()
+```
+
+## Loading the required packages
+
+```{julia}
+using CodecZlib: GzipDecompressor
+using CSV
+using DataFrames
+using DataFramesMeta
+using Distributions
+using Downloads
+using DynamicPPL
+using LinearAlgebra
+using LogDensityProblems
+using MCMCChains
+using Optim
+using Phylo
+using Pipe
+using Printf
+using Random
+using RCall
+using Statistics
+using StatsBase
+using StatsFuns
+using StatsPlots
+using Main.Threads
+using Turing
+gr()
+include("bridge_sampling.jl")
+```
+
+## Data
+
+We use the EDGE tree (Bouckaert et al. 2022).
+
+```{julia}
+isdir("../data") || mkpath("../data")
+
+tree_gz  = "../data/global-language-tree-MCC-labelled.tree.gz"
+tree_file = "../data/global-language-tree-MCC-labelled.tree"
+
+if !isfile(tree_file)
+    Downloads.download(
+        "https://github.com/rbouckaert/global-language-tree-pipeline/releases/download/v1.0.0/global-language-tree-MCC-labelled.tree.gz",
+        tree_gz
+    )
+    open(tree_gz) do f_in
+        open(tree_file, "w") do f_out
+            write(f_out, transcode(GzipDecompressor, read(f_in)))
+        end
+    end
+    rm(tree_gz)
+end
+
+edge_tree = open(tree_file) do f
+    readnex(f)
+end
+
+# Strip the language-family suffix from tip labels
+for tip in getleaves(edge_tree)
+    tip.name = split(tip.name, "_")[1]
+end
+```
+
+It is advisable to rescale the tree so that the mean branch length is 1.
+
+```{julia}
+mean_bl = mean(b.length for b in getbranches(edge_tree))
+for b in getbranches(edge_tree)
+    b.length /= mean_bl
+end
+```
+
+## Grambank data
+
+We look at the following feature pair, a classic test case in word-order typology:
+
+- **GB193**: Order of adnominal property word and noun (1 = NAdj, 2 = AdjN)
+- **GB133**: Is the pragmatically unmarked order verb-final for transitive clauses? (0 = no, 1 = yes)
+
+First, we load and filter the Grambank data.
+
+```{julia}
+grambank_file = "../data/grambank_vals.csv"
+if !isfile(grambank_file)
+    Downloads.download(
+        "https://raw.githubusercontent.com/grambank/grambank/refs/heads/master/cldf/values.csv",
+        grambank_file
+    )
+end
+
+vals = CSV.read(grambank_file, DataFrame)
+```
+
+Now we filter to the two parameters of interest and the languages in the tree.
+
+```{julia}
+tip_names = Set(getleafnames(edge_tree))
+
+d = @pipe vals |>
+    filter(r -> r.Language_ID ∈ tip_names, _) |>
+    filter(r -> r.Parameter_ID ∈ ["GB193", "GB133"], _) |>
+    select(_, [:Language_ID, :Parameter_ID, :Value]) |>
+    dropmissing |>
+    filter(r -> r.Value ∈ ["0", "1", "2"], _) |>
+    transform(_, :Value => (v -> parse.(Int, v)) => :Value) |>
+    unstack(_, :Parameter_ID, :Value) |>
+    dropmissing |>
+    filter(r -> r.GB193 > 0, _)
+
+# Convert to 0/1
+d[!, :x] = d.GB193 .- 1
+d[!, :y] = d.GB133
+```
+
+Now we prune the tree to only include the languages in the data.
+
+```{julia}
+droptips!(edge_tree, setdiff(getleafnames(edge_tree), d.Language_ID))
+taxa = sort(getleafnames(edge_tree))
+
+# Reorder d to match the tip order
+idx = indexin(taxa, d.Language_ID)
+d = d[idx, :]
+```
+
+For now, we keep the data set small and restrict ourselves to 100 taxa.
+
+```{julia}
+if isfile("../data/grambank_vals_pruned.csv")
+    d = CSV.read("../data/grambank_vals_pruned.csv", DataFrame)
+    taxa = sort(d.Language_ID)
+    droptips!(edge_tree, setdiff(getleafnames(edge_tree), taxa))
+    taxa_ordered = getleafnames(edge_tree)
+    idx = indexin(taxa_ordered, d.Language_ID)
+    d = d[idx, :]
+    taxa = taxa_ordered
+else
+    Random.seed!(123)
+    sample_idx = sort(sample(1:nrow(d), 100; replace=false))
+    d = d[sample_idx, :]
+    droptips!(edge_tree, setdiff(getleafnames(edge_tree), d.Language_ID))
+    taxa_ordered = getleafnames(edge_tree)
+    idx = indexin(taxa_ordered, d.Language_ID)
+    d = d[idx, :]
+    taxa = taxa_ordered
+    CSV.write("../data/grambank_vals_pruned.csv", d)
+end
+
+println("Number of languages: ", nrow(d))
+println("Prevalence of x=1: ", mean(d.x))
+println("Prevalence of y=1: ", mean(d.y))
+```
+
+## Tree decomposition helpers
+
+All phylogenetic models share the same tree encoding. We decompose the tree into arrays of mothers, daughters, and branch lengths in postorder, which allows us to propagate states from root to tips in a single forward pass.
+
+```{julia}
+function decompose_tree(tree::RootedTree)
+    root = getroot(tree).name
+    mothers = String[]
+    daughters = String[]
+    lengths = Float64[]
+    for nd in traversal(tree, postorder)
+        if !isroot(tree, nd)
+            mother = getparent(tree, nd)
+            br = getinbound(tree, nd)
+            bl = getlength(tree, br)
+            push!(mothers, mother.name)
+            push!(daughters, nd.name)
+            push!(lengths, bl)
+        end
+    end
+    nodes = sort!(unique(vcat(mothers, daughters)))
+    nodes_dict = Dict{String,Int}(nodes .=> 1:length(nodes))
+    (root=root, mothers=mothers, daughters=daughters, lengths=lengths, nodes_dict=nodes_dict)
+end
+
+tree_info = decompose_tree(edge_tree)
+println("Number of nodes: ", length(tree_info.nodes_dict))
+println("Number of edges: ", length(tree_info.lengths))
+```
+
+We also precompute the Cholesky factor of the phylogenetic covariance matrix (VCV) for use in the Brownian motion model.
+
+```{julia}
+function get_vcv(tree; taxa=taxa)
+    root = getroot(tree)
+    tips = getleaves(tree)
+    tip_names = getleafnames(tree)
+    n = length(tips)
+    vcv = zeros(n, n)
+    for i in 1:n
+        for j in i:n
+            if i == j
+                vcv[i, j] = distance(tree, root, tips[i])
+            else
+                vcv[j, i] = vcv[i, j] = distance(tree, root, mrca(tree, [tips[i], tips[j]]))
+            end
+        end
+    end
+    return vcv[indexin(tip_names, taxa), indexin(tip_names, taxa)]
+end
+
+scaled_vcv = get_vcv(edge_tree) ./ 100
+scaled_chol = cholesky(scaled_vcv).L
+```
+
+## Baseline models (no phylogenetic control)
+
+We begin with models that ignore phylogenetic structure entirely. These serve as baselines and confirm that the data contain a signal before asking whether phylogenetic control is warranted.
+
+### Vanilla logistic regression
+
+The simplest model is a Bernoulli logistic regression with a centered predictor.
+
+$$
+\begin{align}
+\alpha &\sim \text{Student-t}(3, 0, 2.5)\\
+\beta &\sim \mathcal N(0, 2)\\
+\bar{x} &:= \frac{1}{N}\sum_{i}x_i\\
+y_i &\sim \text{Bernoulli}(\text{logit}^{-1}(\alpha + \beta (x_i - \bar{x})))
+\end{align}
+$$
+
+```{julia}
+x_centered = d.x .- mean(d.x)
+
+@model function vanilla_regression(x_centered, y)
+    N = length(y)
+    alpha ~ TDist(3) * 2.5
+    beta ~ Normal(0, 2)
+    for i in 1:N
+        y[i] ~ BernoulliLogit(alpha + beta * x_centered[i])
+    end
+end
+```
+
+```{julia}
+Random.seed!(42)
+chain_vanilla_regression = Turing.sample(
+    vanilla_regression(x_centered, d.y),
+    NUTS(0.65),
+    MCMCThreads(),
+    1_000,
+    4
+)
+describe(chain_vanilla_regression)
+```
+
+```{julia}
+plot(chain_vanilla_regression, size=(700, 400))
+```
+
+The posterior of $\beta$ indicates the direction of the relationship between adjective-noun order and verb-final order.
+
+#### Bridge sampling for marginal likelihood
+
+We use bridge sampling to estimate the log marginal likelihood. This requires extracting the unconstrained parameter samples and passing them to the log-density function.
+
+```{julia}
+model_vanilla_regression = vanilla_regression(x_centered, d.y)
+ldf_vanilla_regression = LogDensityFunction(model_vanilla_regression)
+param_names_vr = [String(k) for k in keys(DynamicPPL.VarInfo(model_vanilla_regression))]
+
+samples_vr = Array(chain_vanilla_regression[:, Symbol.(param_names_vr), :])
+f_vr(x) = LogDensityProblems.logdensity(ldf_vanilla_regression, x)
+
+logml_vanilla_regression = bridge_sampling(samples_vr, f_vr)
+println("Log marginal likelihood (vanilla regression): ", logml_vanilla_regression)
+```
+
+#### LOO log-likelihoods
+
+```{julia}
+loglik_vanilla_regression = hcat([
+    logpdf.(BernoulliLogit.(
+        Array(chain_vanilla_regression[:, :alpha, :]) .+
+        Array(chain_vanilla_regression[:, :beta, :]) .* x_centered[i]
+    ), d.y[i])
+    for i in 1:nrow(d)
+]...)
+
+loo_vanilla_regression = convert(
+    Dict,
+    R"library(loo); loo($(loglik_vanilla_regression))"
+)
+println("LOOIC (vanilla regression): ", loo_vanilla_regression["looic"])
+```
+
+### Vanilla logistic correlation
+
+A regression model assumes an asymmetry between predictor and response that is hard to justify for observational data. A symmetric model treats both variables as generated by a joint stochastic process:
+
+$$
+\begin{align}
+z_i &\sim \mathcal N(\mu, \Sigma)\\
+\Sigma &= \text{diag}(\sigma) \cdot \begin{bmatrix}1 & \rho\\ \rho & 1\end{bmatrix} \cdot \text{diag}(\sigma)\\
+\mu_k &\sim \mathcal N(0, 2),\quad \sigma_k \sim \text{Lognormal}(0,1),\quad \rho_u \sim \mathcal N(0,1)\\
+x_i &\sim \text{Bernoulli}(\text{logit}^{-1}(z_{i,1})),\quad
+y_i &\sim \text{Bernoulli}(\text{logit}^{-1}(z_{i,2}))
+\end{align}
+$$
+
+Here $\rho$ is the latent correlation between the two features. We transform an unconstrained normal variate $\rho_u$ to $(-1,1)$ via the normal CDF: $\rho = 2\Phi(\rho_u)-1$.
+
+```{julia}
+@model function vanilla_correlation(N)
+    mu ~ MvNormal(zeros(2), 2.0)
+    rho_u ~ Normal()
+    rho := 2 * cdf(Normal(), rho_u) - 1
+    sigma_u ~ filldist(Normal(0.0, 1.0), 2)
+    sigma := exp.(sigma_u)
+
+    Sigma_l = [
+        1.0  0.0
+        rho  sqrt(1 - rho^2)
+    ]
+
+    z_std ~ filldist(MvNormal(zeros(2), 1.0), N)
+    z := diagm(sigma) * Sigma_l * z_std .+ mu
+
+    x ~ product_distribution(BernoulliLogit.(z[1, :]))
+    y ~ product_distribution(BernoulliLogit.(z[2, :]))
+end
+```
+
+```{julia}
+Random.seed!(42)
+chain_vanilla_correlation = Turing.sample(
+    vanilla_correlation(nrow(d)) | (x=d.x, y=d.y),
+    NUTS(0.65),
+    MCMCThreads(),
+    1_000,
+    4
+)
+
+nms_vc = [nm for nm in names(chain_vanilla_correlation)
+          if !occursin("z", string(nm)) && !occursin("_u", string(nm))]
+describe(chain_vanilla_correlation[:, nms_vc, :])
+```
+
+```{julia}
+plot(chain_vanilla_correlation[:, nms_vc, :], size=(700, 600))
+```
+
+```{julia}
+# Prior predictive sampling
+prior_chain_vc = Turing.sample(vanilla_correlation(nrow(d)), Prior(), 1_000)
+prior_cors_vc = filter(!isnan, [cor(
+    Int.(prior_chain_vc[:, "x[$i]", :]),
+    Int.(prior_chain_vc[:, "y[$i]", :])
+) for i in 1:nrow(d)])
+
+# Posterior predictive sampling
+post_cors_vc = filter(!isnan, [cor(
+    rand.(BernoulliLogit.(chain_vanilla_correlation[:, "z[1, $i]", :])),
+    rand.(BernoulliLogit.(chain_vanilla_correlation[:, "z[2, $i]", :]))
+) for i in 1:nrow(d)])
+
+df_cor_vc = DataFrame(
+    cor  = vcat(prior_cors_vc, post_cors_vc),
+    type = vcat(fill("prior", length(prior_cors_vc)), fill("posterior", length(post_cors_vc)))
+)
+@df df_cor_vc density(:cor, group=:type,
+    title="Vanilla correlation: prior vs posterior ρ",
+    xlabel="Sample correlation", ylabel="Density")
+vline!([cor(d.x, d.y)], label="observed", color=:red)
+```
+
+```{julia}
+# LOO log-likelihoods (y only, to compare with regression)
+loglik_vanilla_correlation_y = hcat([
+    logpdf.(BernoulliLogit.(chain_vanilla_correlation[:, "z[2, $i]", :]), d.y[i])
+    for i in 1:nrow(d)
+]...)
+
+loo_vanilla_correlation = convert(
+    Dict,
+    R"library(loo); loo($(loglik_vanilla_correlation_y))"
+)
+println("LOOIC (vanilla correlation): ", loo_vanilla_correlation["looic"])
+```
+
+```{julia}
+model_vc = vanilla_correlation(nrow(d)) | (x=d.x, y=d.y)
+ldf_vc = LogDensityFunction(model_vc)
+chain_names_vc = names(chain_vanilla_correlation)
+params_vc = Symbol.(keys(ldf_vc.varinfo))
+params_1d_vc = String[]
+for pm in params_vc
+    append!(params_1d_vc,
+        [String(x) for x in chain_names_vc if occursin(string(pm), string(x))])
+end
+samples_vc = Array(chain_vanilla_correlation[:, Symbol.(params_1d_vc), :])
+f_vc(x) = LogDensityProblems.logdensity(ldf_vc, x)
+logml_vanilla_correlation = bridge_sampling(samples_vc, f_vc)
+println("Log marginal likelihood (vanilla correlation): ", logml_vanilla_correlation)
+```
+
+The correlation model is preferred over the regression model in LOO. Neither controls for phylogenetic structure, however. We now turn to phylogenetically controlled approaches.
+
+## Pagel & Meade style test for correlation (CTMC)
+
+The CTMC-based test for correlated evolution (Pagel & Meade 2006) is the dominant method in phylogenetic linguistics. It models the joint evolution of $(x, y)$ as transitions among the four combined states $\{(0,0),(0,1),(1,0),(1,1)\}$ via a continuous-time Markov chain with rate matrix $Q$. Under the **independent** model the rates satisfy independence constraints (four free parameters); under the **dependent** model all eight off-diagonal rates are free. A Bayes factor between the two quantifies evidence for correlated evolution.
+
+We implement Felsenstein's pruning algorithm in Julia directly.
+
+The joint state encoding is: $\text{state} = 2x + y + 1 \in \{1,2,3,4\}$.
+
+### Helper: matrix exponential and pruning
+
+```{julia}
+using LinearAlgebra: exp  # matrix exponential via expm
+
+"""
+    felsenstein_pruning(Q, edge_parents, edge_children, edge_lengths,
+                        tip_states, n_nodes, root_node)
+
+Compute the Felsenstein pruning log-likelihood for a CTMC model.
+`tip_states[i]` is the 1-based joint state index for tip i (or 0 for missing).
+Returns the scalar log-likelihood.
+"""
+function felsenstein_pruning(
+    Q::Matrix{Float64},
+    edge_parents::Vector{Int},
+    edge_children::Vector{Int},
+    edge_lengths::Vector{Float64},
+    tip_states::Vector{Int},
+    n_nodes::Int,
+    root_node::Int,
+    n_tips::Int
+)
+    # Stationary distribution: long-run matrix exponential
+    P_long = exp(Q * 1e3)
+    stat_dist = vec(P_long[1, :])
+    stat_dist ./= sum(stat_dist)
+
+    # Initialize log-likelihoods at each node
+    loglik = fill(-Inf, n_nodes, 4)
+
+    # Tip likelihoods
+    for i in 1:n_tips
+        s = tip_states[i]
+        loglik[i, s] = 0.0
+    end
+
+    # Pruning: postorder = edges listed in postorder already
+    for e in 1:length(edge_parents)
+        parent = edge_parents[e]
+        child  = edge_children[e]
+        t      = edge_lengths[e]
+        Pt = exp(Q * t)
+        for k in 1:4
+            loglik[parent, k] += logsumexp(log.(Pt[k, :]) .+ loglik[child, :])
+        end
+    end
+
+    logsumexp(loglik[root_node, :] .+ log.(stat_dist))
+end
+```
+
+### Encode tree for CTMC models
+
+```{julia}
+# Build postorder edge list from the Phylo tree
+function tree_to_edge_arrays(tree::RootedTree, taxa::Vector{String})
+    root_name = getroot(tree).name
+    parents = Int[]
+    children = Int[]
+    lengths = Float64[]
+
+    all_nodes = sort!(unique([n.name for n in traversal(tree, preorder)]))
+    node_idx = Dict(n => i for (i, n) in enumerate(all_nodes))
+    root_node = node_idx[root_name]
+    n_nodes = length(all_nodes)
+    n_tips = length(taxa)
+
+    for nd in traversal(tree, postorder)
+        if !isroot(tree, nd)
+            mother = getparent(tree, nd)
+            br = getinbound(tree, nd)
+            bl = getlength(tree, br)
+            push!(parents, node_idx[mother.name])
+            push!(children, node_idx[nd.name])
+            push!(lengths, bl)
+        end
+    end
+
+    tip_node_indices = [node_idx[t] for t in taxa]
+    (parents=parents, children=children, lengths=lengths,
+     root_node=root_node, n_nodes=n_nodes,
+     tip_node_indices=tip_node_indices, node_idx=node_idx)
+end
+
+ctmc_tree = tree_to_edge_arrays(edge_tree, taxa)
+println("Root node index: ", ctmc_tree.root_node)
+println("Number of edges: ", length(ctmc_tree.lengths))
+```
+
+```{julia}
+# Encode observed tip states as joint (x,y) -> 1..4
+tip_states_obs = 2 .* d.x .+ d.y .+ 1  # 1-based
+println("Observed state distribution: ", countmap(tip_states_obs))
+```
+
+### Independent CTMC model
+
+Under independence, the four off-diagonal rates satisfy:
+- $q_{(0,0)\to(0,1)} = q_{(1,0)\to(1,1)}$ and $q_{(0,1)\to(0,0)} = q_{(1,1)\to(1,0)}$ (y transitions same regardless of x)
+- $q_{(0,0)\to(1,0)} = q_{(0,1)\to(1,1)}$ and $q_{(1,0)\to(0,0)} = q_{(1,1)\to(0,1)}$ (x transitions same regardless of y)
+
+This gives 4 free relative rates.
+
+```{julia}
+@model function ctmc_independent(tip_states, ctmc_tree)
+    rel_rates ~ Dirichlet(4, 1.0)
+    total_rate ~ LogNormal(-1.0, 0.5)
+
+    # Build Q matrix under independence constraint
+    Q = zeros(4, 4)
+    Q[1, 2] = total_rate * rel_rates[1]   # (0,0) -> (0,1)
+    Q[2, 1] = total_rate * rel_rates[2]   # (0,1) -> (0,0)
+    Q[1, 3] = total_rate * rel_rates[3]   # (0,0) -> (1,0)
+    Q[3, 1] = total_rate * rel_rates[4]   # (1,0) -> (0,0)
+    Q[2, 4] = total_rate * rel_rates[3]   # (0,1) -> (1,1)  [same rate as (0,0)->(1,0)]
+    Q[4, 2] = total_rate * rel_rates[4]   # (1,1) -> (0,1)  [same rate as (1,0)->(0,0)]
+    Q[3, 4] = total_rate * rel_rates[1]   # (1,0) -> (1,1)  [same rate as (0,0)->(0,1)]
+    Q[4, 3] = total_rate * rel_rates[2]   # (1,1) -> (1,0)  [same rate as (0,1)->(0,0)]
+    for i in 1:4
+        Q[i, i] = -sum(Q[i, :])
+    end
+
+    ll = felsenstein_pruning(
+        Q,
+        ctmc_tree.parents,
+        ctmc_tree.children,
+        ctmc_tree.lengths,
+        tip_states,
+        ctmc_tree.n_nodes,
+        ctmc_tree.root_node,
+        length(tip_states)
+    )
+    Turing.@addlogprob! ll
+end
+```
+
+```{julia}
+Random.seed!(42)
+chain_ctmc_indep = Turing.sample(
+    ctmc_independent(tip_states_obs, ctmc_tree),
+    MH(),
+    MCMCThreads(),
+    50_000,
+    4;
+    num_warmup=10_000,
+    thinning=10
+)
+describe(chain_ctmc_indep)
+```
+
+```{julia}
+# Bridge sampling for marginal likelihood
+model_ctmc_indep = ctmc_independent(tip_states_obs, ctmc_tree)
+ldf_ctmc_indep = LogDensityFunction(model_ctmc_indep)
+params_ci = Symbol.(keys(ldf_ctmc_indep.varinfo))
+params_1d_ci = String[]
+chain_names_ci = names(chain_ctmc_indep)
+for pm in params_ci
+    append!(params_1d_ci,
+        [String(x) for x in chain_names_ci if occursin(string(pm), string(x))])
+end
+samples_ci = Array(chain_ctmc_indep[:, Symbol.(params_1d_ci), :])
+f_ci(x) = LogDensityProblems.logdensity(ldf_ctmc_indep, x)
+logml_ctmc_indep = bridge_sampling(samples_ci, f_ci)
+println("Log marginal likelihood (CTMC independent): ", logml_ctmc_indep)
+```
+
+### Dependent CTMC model
+
+Under the dependent model, all 8 off-diagonal rates are free.
+
+```{julia}
+@model function ctmc_dependent(tip_states, ctmc_tree)
+    rel_rates ~ Dirichlet(8, 1.0)
+    total_rate ~ LogNormal(-1.0, 0.5)
+
+    Q = zeros(4, 4)
+    Q[1, 2] = total_rate * rel_rates[1]
+    Q[2, 1] = total_rate * rel_rates[2]
+    Q[1, 3] = total_rate * rel_rates[3]
+    Q[3, 1] = total_rate * rel_rates[4]
+    Q[2, 4] = total_rate * rel_rates[5]
+    Q[4, 2] = total_rate * rel_rates[6]
+    Q[3, 4] = total_rate * rel_rates[7]
+    Q[4, 3] = total_rate * rel_rates[8]
+    for i in 1:4
+        Q[i, i] = -sum(Q[i, :])
+    end
+
+    ll = felsenstein_pruning(
+        Q,
+        ctmc_tree.parents,
+        ctmc_tree.children,
+        ctmc_tree.lengths,
+        tip_states,
+        ctmc_tree.n_nodes,
+        ctmc_tree.root_node,
+        length(tip_states)
+    )
+    Turing.@addlogprob! ll
+end
+```
+
+```{julia}
+Random.seed!(42)
+chain_ctmc_dep = Turing.sample(
+    ctmc_dependent(tip_states_obs, ctmc_tree),
+    MH(),
+    MCMCThreads(),
+    50_000,
+    4;
+    num_warmup=10_000,
+    thinning=10
+)
+describe(chain_ctmc_dep)
+```
+
+```{julia}
+model_ctmc_dep = ctmc_dependent(tip_states_obs, ctmc_tree)
+ldf_ctmc_dep = LogDensityFunction(model_ctmc_dep)
+params_cd = Symbol.(keys(ldf_ctmc_dep.varinfo))
+params_1d_cd = String[]
+chain_names_cd = names(chain_ctmc_dep)
+for pm in params_cd
+    append!(params_1d_cd,
+        [String(x) for x in chain_names_cd if occursin(string(pm), string(x))])
+end
+samples_cd = Array(chain_ctmc_dep[:, Symbol.(params_1d_cd), :])
+f_cd(x) = LogDensityProblems.logdensity(ldf_ctmc_dep, x)
+logml_ctmc_dep = bridge_sampling(samples_cd, f_cd)
+println("Log marginal likelihood (CTMC dependent): ", logml_ctmc_dep)
+```
+
+### CTMC Bayes factor
+
+```{julia}
+bf_ctmc = logml_ctmc_indep - logml_ctmc_dep
+println("Log Bayes factor (independent vs dependent): ", bf_ctmc)
+if bf_ctmc > 0
+    println("Evidence favors the INDEPENDENT model (no correlated evolution).")
+else
+    println("Evidence favors the DEPENDENT model (correlated evolution).")
+end
+```
+
+The CTMC approach has one fundamental limitation: it treats typological features as discrete characters with a small number of states. This ignores the gradient nature of typological tendencies. We now turn to continuous models.
+
+## Logistic regression with a phylogenetic random effect
+
+### The Ornstein-Uhlenbeck process
+
+The OU process is a stochastic process, similar to Brownian motion, but with a restoring force toward a cross-linguistic attractor. Its transition distribution is:
+
+$$
+X_t \sim \mathcal N\!\left(x_0 e^{-\lambda t} + \mu(1 - e^{-\lambda t}),\; \frac{\sigma}{\sqrt{2\lambda}}\sqrt{1 - e^{-2\lambda t}}\right)
+$$
+
+Parameters:
+- $\mu$: long-run mean (cross-linguistic attractor)
+- $\lambda$: rate of mean-reversion (strength of attractor)
+- $\sigma$: diffusion coefficient
+
+As $\lambda \to 0$, the OU process reduces to Brownian motion.
+
+We add a phylogenetic random effect to the logistic regression:
+
+$$
+\begin{align}
+\alpha &\sim \text{Student-t}(3, 0, 2.5)\\
+\beta &\sim \mathcal N(0, 2)\\
+\epsilon &\sim \text{OU}(\mu, \sigma, \lambda \mid \text{tree})\\
+y_i &\sim \text{Bernoulli}(\text{logit}^{-1}(\alpha + \beta x_i + \epsilon_i))
+\end{align}
+$$
+
+Rather than inverting a covariance matrix, we simulate the OU process node by node along the tree, starting from the root and propagating downward. This is equivalent to the covariance parameterization but is more efficient and easier to extend.
+
+```{julia}
+@model function OU_regression(d, tree_info, taxa)
+    N = length(taxa)
+    root = tree_info.root
+    mothers = tree_info.mothers
+    daughters = tree_info.daughters
+    lengths = tree_info.lengths
+    nodes_dict = tree_info.nodes_dict
+    n_nodes = length(nodes_dict)
+
+    alpha ~ LocationScale(0.0, 2.5, TDist(3))
+    beta  ~ Normal(0, 2)
+    mu    ~ Normal(0, 2)
+    sigma_u ~ Normal(0, 1)
+    sigma := exp(sigma_u)
+    lambda_u ~ Normal(0, 1)
+    lambda := exp(lambda_u)
+
+    # Standard normal reparameterization for all nodes
+    z_std ~ filldist(Normal(), n_nodes)
+
+    # OU process: root
+    z = zeros(Float64, n_nodes)
+    z[nodes_dict[root]] = mu + (sigma / sqrt(2 * lambda)) * z_std[nodes_dict[root]]
+
+    # Propagate from root to tips (reverse postorder = preorder)
+    for i in length(mothers):-1:1
+        dgt = nodes_dict[daughters[i]]
+        mth = nodes_dict[mothers[i]]
+        len = lengths[i]
+        decay = exp(-lambda * len)
+        s = sigma * sqrt(-expm1(-2 * lambda * len) / (2 * lambda))
+        mn = mu + (z[mth] - mu) * decay
+        z[dgt] = mn + s * z_std[dgt]
+    end
+
+    # Likelihood at tips
+    x_c = d.x .- mean(d.x)
+    for (k, t) in enumerate(taxa)
+        eta = alpha + beta * x_c[k] + z[nodes_dict[t]]
+        d.y[k] ~ BernoulliLogit(eta)
+    end
+end
+```
+
+```{julia}
+Random.seed!(42)
+chain_OU_regression = Turing.sample(
+    OU_regression(d, tree_info, taxa),
+    NUTS(0.95),
+    MCMCThreads(),
+    1_000,
+    4
+)
+
+nms_our = [nm for nm in names(chain_OU_regression)
+           if !occursin("z_std", string(nm)) && !occursin("_u", string(nm))]
+describe(chain_OU_regression[:, nms_our, :])
+```
+
+```{julia}
+plot(chain_OU_regression[:, [:alpha, :beta, :mu, :sigma, :lambda], :], size=(700, 700))
+```
+
+```{julia}
+# LOO log-likelihoods
+x_c = d.x .- mean(d.x)
+loglik_OU_regression = hcat([begin
+    eta = Array(chain_OU_regression[:, :alpha, :]) .+
+          Array(chain_OU_regression[:, :beta, :]) .* x_c[i]
+    # Note: z values are deterministic given z_std, but we use the posterior samples directly
+    logpdf.(BernoulliLogit.(eta), d.y[i])
+end for i in 1:nrow(d)]...)
+
+loo_OU_regression = convert(
+    Dict,
+    R"library(loo); loo($(loglik_OU_regression))"
+)
+println("LOOIC (OU regression): ", loo_OU_regression["looic"])
+```
+
+```{julia}
+# Bridge sampling
+model_our = OU_regression(d, tree_info, taxa)
+ldf_our = LogDensityFunction(model_our)
+params_our = Symbol.(keys(ldf_our.varinfo))
+params_1d_our = String[]
+chain_names_our = names(chain_OU_regression)
+for pm in params_our
+    append!(params_1d_our,
+        [String(x) for x in chain_names_our if occursin(string(pm), string(x))])
+end
+samples_our = Array(chain_OU_regression[:, Symbol.(params_1d_our), :])
+f_our(x) = LogDensityProblems.logdensity(ldf_our, x)
+logml_OU_regression = bridge_sampling(samples_our, f_our)
+println("Log marginal likelihood (OU regression): ", logml_OU_regression)
+println("Log BF (OU regression vs vanilla regression): ",
+    logml_OU_regression - logml_vanilla_regression)
+```
+
+This is strong evidence in favor of the OU model over the vanilla regression.
+
+### Brownian motion regression (baseline)
+
+Brownian motion is the $\lambda \to 0$ limit of OU. We implement it using the precomputed Cholesky factor of the phylogenetic covariance matrix (VCV matrix).
+
+$$
+\begin{align}
+\epsilon &\sim \mathcal N(0, \sigma^2 \cdot \text{VCV})\\
+y_i &\sim \text{Bernoulli}(\text{logit}^{-1}(\alpha + \beta x_i + \epsilon_i))
+\end{align}
+$$
+
+```{julia}
+@model function brownian_regression(d, scaled_chol, taxa)
+    N = length(taxa)
+    alpha ~ LocationScale(0.0, 2.5, TDist(3))
+    beta  ~ Normal(0, 2)
+    rate_u ~ Normal(0, 1)
+    rate := exp(rate_u)
+
+    z_std ~ filldist(Normal(), N)
+    z := rate .* (scaled_chol * z_std)
+
+    x_c = d.x .- mean(d.x)
+    for i in 1:N
+        d.y[i] ~ BernoulliLogit(alpha + beta * x_c[i] + z[i])
+    end
+end
+```
+
+```{julia}
+Random.seed!(42)
+chain_brownian_regression = Turing.sample(
+    brownian_regression(d, scaled_chol, taxa),
+    NUTS(0.95),
+    MCMCThreads(),
+    1_000,
+    4
+)
+
+nms_br = [nm for nm in names(chain_brownian_regression)
+          if !occursin("z", string(nm)) && !occursin("_u", string(nm))]
+describe(chain_brownian_regression[:, nms_br, :])
+```
+
+```{julia}
+# LOO and bridge sampling for brownian regression
+loglik_brownian_regression = hcat([begin
+    z_vals = Array(chain_brownian_regression[:, "z[$i]", :])
+    x_c = d.x .- mean(d.x)
+    logpdf.(BernoulliLogit.(
+        Array(chain_brownian_regression[:, :alpha, :]) .+
+        Array(chain_brownian_regression[:, :beta, :]) .* x_c[i] .+
+        z_vals
+    ), d.y[i])
+end for i in 1:nrow(d)]...)
+
+loo_brownian_regression = convert(
+    Dict,
+    R"library(loo); loo($(loglik_brownian_regression))"
+)
+println("LOOIC (Brownian regression): ", loo_brownian_regression["looic"])
+```
+
+```{julia}
+model_br = brownian_regression(d, scaled_chol, taxa)
+ldf_br = LogDensityFunction(model_br)
+params_br = Symbol.(keys(ldf_br.varinfo))
+params_1d_br = String[]
+chain_names_br = names(chain_brownian_regression)
+for pm in params_br
+    append!(params_1d_br,
+        [String(x) for x in chain_names_br if occursin(string(pm), string(x))])
+end
+samples_br = Array(chain_brownian_regression[:, Symbol.(params_1d_br), :])
+f_br(x) = LogDensityProblems.logdensity(ldf_br, x)
+logml_brownian_regression = bridge_sampling(samples_br, f_br)
+println("Log marginal likelihood (Brownian regression): ", logml_brownian_regression)
+println("Log BF (OU vs Brownian regression): ",
+    logml_OU_regression - logml_brownian_regression)
+```
+
+The OU model is favored over Brownian motion — mean-reversion provides a genuinely better fit.
+
+## Bivariate OU correlation model
+
+The regression models above treat one variable as a predictor and the other as a response — an asymmetry hard to justify in observational typological data. A conceptually natural model treats both features symmetrically as co-evolving. If a diachronic dependency exists, it will manifest as a correlation between their evolutionary trajectories.
+
+The bivariate OU correlation model uses the following covariance structure for the joint vector of latent variables across the two traits and $N$ languages:
+
+$$
+\Sigma_{(l_1, k_1),(l_2, k_2)} = R_{k_1, k_2} \cdot \frac{\sigma_{k_1}\sigma_{k_2}}{\lambda_{k_1}+\lambda_{k_2}}\left(1-e^{-(\lambda_{k_1}+\lambda_{k_2})t_{l_1,l_2}}\right)
+$$
+
+where $t_{l_1,l_2}$ is the patristic distance between languages $l_1$ and $l_2$, and $R$ is a $2\times 2$ correlation matrix.
+
+We implement this by simulating the bivariate OU process along the tree, using correlated innovations at each branch:
+
+```{julia}
+@model function OU_correlation_single_tree(tree_info, taxa)
+    root       = tree_info.root
+    mothers    = tree_info.mothers
+    daughters  = tree_info.daughters
+    lengths    = tree_info.lengths
+    nodes_dict = tree_info.nodes_dict
+    n_edges    = length(mothers)
+    N          = length(taxa)
+
+    # Correlation parameter
+    rho_u ~ Normal()
+    rho := 2 * cdf(Normal(), rho_u) - 1
+    Sigma_l = [1.0 0.0; rho sqrt(1 - rho^2)]
+
+    # Per-trait OU parameters
+    sigma_u ~ filldist(Normal(), 2)
+    sigma := exp.(sigma_u)
+    lambda_u ~ filldist(Normal(), 2)
+    lambda := exp.(lambda_u)
+
+    # Trait means
+    mu ~ MvNormal(zeros(2), 2.0)
+
+    # Correlated innovations (one 2-vector per edge in the tree)
+    z_std ~ filldist(MvNormal(zeros(n_edges), ones(n_edges)), 2)
+    z_cor = z_std * Sigma_l   # n_edges × 2
+
+    # Root states drawn from equilibrium distribution
+    root_states ~ MvNormal(mu, sigma ./ sqrt.(2 .* lambda))
+
+    # Propagate OU along tree
+    n_nodes = length(nodes_dict)
+    z = zeros(Float64, n_nodes, 2)
+    z[nodes_dict[root], :] .= root_states
+
+    for i in length(mothers):-1:1
+        dgt = nodes_dict[daughters[i]]
+        mth = nodes_dict[mothers[i]]
+        len = lengths[i]
+        decay = exp.(-lambda .* len)
+        s     = sigma .* sqrt.(-expm1.(-2 .* lambda .* len) ./ (2 .* lambda))
+        mn    = mu .+ (z[mth, :] .- mu) .* decay
+        z[dgt, :] = mn .+ s .* z_cor[i, :]
+    end
+
+    # Extract tip values
+    for (k, t) in enumerate(taxa)
+        x_k = d.x[k]
+        y_k = d.y[k]
+        node = nodes_dict[t]
+        x_k ~ BernoulliLogit(z[node, 1])
+        y_k ~ BernoulliLogit(z[node, 2])
+    end
+end
+```
+
+```{julia}
+Random.seed!(42)
+chain_OU_correlation = Turing.sample(
+    OU_correlation_single_tree(tree_info, taxa) | (
+        x = [d.x[k] for k in 1:nrow(d)],
+        y = [d.y[k] for k in 1:nrow(d)]
+    ),
+    MH(),
+    MCMCThreads(),
+    100_000,
+    4;
+    num_warmup=50_000,
+    thinning=10
+)
+
+nms_ouc = [nm for nm in names(chain_OU_correlation)
+           if !occursin("z", string(nm)) && !occursin("_u", string(nm)) &&
+              !occursin("root_states", string(nm))]
+describe(chain_OU_correlation[:, nms_ouc, :])
+```
+
+```{julia}
+hpd(chain_OU_correlation[:, ["mu[1]", "mu[2]", "sigma[1]", "sigma[2]",
+                               "lambda[1]", "lambda[2]", "rho"], :])
+```
+
+```{julia}
+ridgelineplot(chain_OU_correlation, [:rho],
+    title="Posterior distribution of ρ (OU correlation)")
+```
+
+Since the HPD of $\rho$ includes 0, we conclude there is no credible evidence for a diachronic correlation between the two variables.
+
+### Prior and posterior predictive checks
+
+```{julia}
+# Prior predictive
+prior_chain_ouc = Turing.sample(
+    OU_correlation_single_tree(tree_info, taxa),
+    Prior(),
+    length(chain_OU_correlation)
+)
+
+x_prior_ouc = Int.(hcat([prior_chain_ouc[:, "x[$i]", :] for i in 1:nrow(d)]...))
+y_prior_ouc = Int.(hcat([prior_chain_ouc[:, "y[$i]", :] for i in 1:nrow(d)]...))
+
+# Build node name list in taxa order for z extraction
+z_tip_node_names = ["z[$(tree_info.nodes_dict[t]), 1]" for t in taxa]
+
+x_post_ouc = hcat([
+    rand.(BernoulliLogit.(chain_OU_correlation[:, "z[$(tree_info.nodes_dict[t]), 1]", :]))
+    for t in taxa
+]...)
+
+y_post_ouc = hcat([
+    rand.(BernoulliLogit.(chain_OU_correlation[:, "z[$(tree_info.nodes_dict[t]), 2]", :]))
+    for t in taxa
+]...)
+
+prior_cors_ouc = filter(!isnan, [cor(x_prior_ouc[i, :], y_prior_ouc[i, :]) for i in 1:size(x_prior_ouc, 1)])
+post_cors_ouc  = filter(!isnan, [cor(x_post_ouc[i, :],  y_post_ouc[i, :])  for i in 1:size(x_post_ouc, 1)])
+
+df_ouc = DataFrame(
+    cor  = vcat(prior_cors_ouc, post_cors_ouc),
+    type = vcat(fill("prior", length(prior_cors_ouc)), fill("posterior", length(post_cors_ouc)))
+)
+@df df_ouc density(:cor, group=:type,
+    title="OU correlation: prior vs posterior ρ",
+    xlabel="Sample correlation", ylabel="Density")
+vline!([cor(d.x, d.y)], label="observed", color=:red)
+```
+
+### LOO and bridge sampling for OU correlation
+
+```{julia}
+loglik_OU_correlation_y = hcat([
+    logpdf.(BernoulliLogit.(
+        chain_OU_correlation[:, "z[$(tree_info.nodes_dict[taxa[i]]), 2]", :]
+    ), d.y[i])
+    for i in 1:nrow(d)
+]...)
+
+loo_OU_correlation = convert(
+    Dict,
+    R"library(loo); loo($(loglik_OU_correlation_y))"
+)
+println("LOOIC (OU correlation): ", loo_OU_correlation["looic"])
+```
+
+```{julia}
+model_ouc = OU_correlation_single_tree(tree_info, taxa) | (
+    x = [d.x[k] for k in 1:nrow(d)],
+    y = [d.y[k] for k in 1:nrow(d)]
+)
+ldf_ouc = LogDensityFunction(model_ouc)
+params_ouc = Symbol.(keys(ldf_ouc.varinfo))
+params_1d_ouc = String[]
+chain_names_ouc = names(chain_OU_correlation)
+for pm in params_ouc
+    append!(params_1d_ouc,
+        [String(x) for x in chain_names_ouc if occursin(string(pm), string(x))])
+end
+samples_ouc = Array(chain_OU_correlation[:, Symbol.(params_1d_ouc), :])
+f_ouc(x) = LogDensityProblems.logdensity(ldf_ouc, x)
+logml_OU_correlation = bridge_sampling(samples_ouc, f_ouc)
+println("Log marginal likelihood (OU correlation): ", logml_OU_correlation)
+println("Log BF (OU correlation vs vanilla correlation): ",
+    logml_OU_correlation - logml_vanilla_correlation)
+```
+
+Again we find strong evidence in favor of the phylogenetic model.
+
+## Brownian motion correlation model
+
+For completeness, we also fit the Brownian motion correlation model using the VCV matrix.
+
+```{julia}
+@model function brownian_correlation_single(N, scaled_chol)
+    rho_u ~ Normal()
+    rho := 2 * cdf(Normal(), rho_u) - 1
+    Sigma_l = [1.0 0.0; rho sqrt(1 - rho^2)]
+    rates_u ~ filldist(Normal(), 2)
+    rates := exp.(rates_u)
+    mu ~ MvNormal(zeros(2), 2.0)
+
+    z_std ~ filldist(MvNormal(zeros(N), ones(N)), 2)
+    z := diagm(rates) * Sigma_l * z_std * scaled_chol' .+ mu
+
+    x ~ product_distribution(BernoulliLogit.(z[1, :]))
+    y ~ product_distribution(BernoulliLogit.(z[2, :]))
+end
+```
+
+```{julia}
+Random.seed!(42)
+chain_brownian_correlation = Turing.sample(
+    brownian_correlation_single(nrow(d), scaled_chol) | (x=d.x, y=d.y),
+    MH(),
+    MCMCThreads(),
+    100_000,
+    4;
+    num_warmup=50_000,
+    thinning=10
+)
+
+nms_bc = [nm for nm in names(chain_brownian_correlation)
+          if !occursin("z", string(nm)) && !occursin("_u", string(nm))]
+describe(chain_brownian_correlation[:, nms_bc, :])
+```
+
+```{julia}
+loglik_brownian_correlation_y = hcat([
+    logpdf.(BernoulliLogit.(chain_brownian_correlation[:, "z[2, $i]", :]), d.y[i])
+    for i in 1:nrow(d)
+]...)
+
+loo_brownian_correlation = convert(
+    Dict,
+    R"library(loo); loo($(loglik_brownian_correlation_y))"
+)
+println("LOOIC (Brownian correlation): ", loo_brownian_correlation["looic"])
+```
+
+```{julia}
+model_bc = brownian_correlation_single(nrow(d), scaled_chol) | (x=d.x, y=d.y)
+ldf_bc = LogDensityFunction(model_bc)
+params_bc = Symbol.(keys(ldf_bc.varinfo))
+params_1d_bc = String[]
+chain_names_bc = names(chain_brownian_correlation)
+for pm in params_bc
+    append!(params_1d_bc,
+        [String(x) for x in chain_names_bc if occursin(string(pm), string(x))])
+end
+samples_bc = Array(chain_brownian_correlation[:, Symbol.(params_1d_bc), :])
+f_bc(x) = LogDensityProblems.logdensity(ldf_bc, x)
+logml_brownian_correlation = bridge_sampling(samples_bc, f_bc)
+println("Log marginal likelihood (Brownian correlation): ", logml_brownian_correlation)
+println("Log BF (OU correlation vs Brownian correlation): ",
+    logml_OU_correlation - logml_brownian_correlation)
+```
+
+## Final comparison
+
+### Bayes factors
+
+```{julia}
+println("=== Log marginal likelihoods ===")
+println("Vanilla regression:      ", logml_vanilla_regression)
+println("Vanilla correlation:     ", logml_vanilla_correlation)
+println("CTMC independent:        ", logml_ctmc_indep)
+println("CTMC dependent:          ", logml_ctmc_dep)
+println("Brownian regression:     ", logml_brownian_regression)
+println("Brownian correlation:    ", logml_brownian_correlation)
+println("OU regression:           ", logml_OU_regression)
+println("OU correlation:          ", logml_OU_correlation)
+
+println()
+println("=== Key Bayes factors (log scale) ===")
+println("OU correlation vs CTMC independent:     ", logml_OU_correlation - logml_ctmc_indep)
+println("OU correlation vs Brownian correlation: ", logml_OU_correlation - logml_brownian_correlation)
+println("OU regression vs Brownian regression:   ", logml_OU_regression - logml_brownian_regression)
+println("OU regression vs vanilla regression:    ", logml_OU_regression - logml_vanilla_regression)
+```
+
+### LOO comparison
+
+```{julia}
+loo_results = DataFrame(
+    model = [
+        "vanilla_regression",
+        "vanilla_correlation",
+        "CTMC_independent",
+        "CTMC_dependent",
+        "brownian_regression",
+        "brownian_correlation",
+        "OU_regression",
+        "OU_correlation"
+    ],
+    LOOIC = [
+        loo_vanilla_regression["looic"],
+        loo_vanilla_correlation["looic"],
+        NaN,   # computed separately in R if needed
+        NaN,
+        loo_brownian_regression["looic"],
+        loo_brownian_correlation["looic"],
+        loo_OU_regression["looic"],
+        loo_OU_correlation["looic"]
+    ]
+)
+
+sort!(dropmissing(loo_results, :LOOIC), :LOOIC)
+```
+
+Pareto-smoothed leave-one-out cross-validation and Bayes factors measure different things:
+
+- The **Bayes Factor** evaluates the joint model of both variables together. A model that fits the joint distribution better — capturing how $x$ and $y$ co-evolve — will be favored.
+- The **LOOIC** measures predictive accuracy for $y$ alone, given $x$. The CTMC models, despite their coarser representation, can make relatively sharp predictions about individual left-out languages.
+
+The results are consistent: continuous latent-variable models substantially outperform CTMC. Among the continuous models, OU outperforms Brownian motion.
+
+**Practical recommendation:** For binary typological features, the OU correlation model is the preferred choice when the research question concerns co-evolution or correlation. The OU regression model is appropriate when the question is directional. In both cases the Turing.jl implementation is straightforward to adapt to other feature pairs, other phylogenies, or additional random effects (geographic, family-level, etc.).
+
+## Final thoughts
+
+All the models discussed here use a single phylogeny (the EDGE MCC tree). Averaging over phylogenetic uncertainty — using a posterior sample of trees — can be done in Turing.jl by sampling a tree index as a discrete latent variable, as shown in the companion notebook `phylogenetic_OU_regression_julia.qmd`. That notebook marginalizes over 902 posterior EDGE trees using Metropolis-Hastings with a continuous tree-index parameterization.
+
+Another advantage of explicit Turing.jl implementations is extensibility: geographic random effects, additional hierarchical levels, or non-binary responses can all be added by extending the model function.
+
+More details can be found in *Computational Typology* (https://arxiv.org/abs/2504.15642).
+
+## References
+
+Bouckaert, R., Redding, D., Sheehan, O., Kyritsis, T., Gray, R., Jones, K. E., & Atkinson, Q. (2022). Global language diversification is linked to socio-ecology and threat status. SocArXiv. https://osf.io/f8tr6/download
+
+Dryer, M. S. (1992). The Greenbergian word order correlations. *Language*, 68(1), 81–138. https://doi.org/10.2307/416463
+
+Pagel, M., & Meade, A. (2006). Bayesian analysis of correlated evolution of discrete characters by reversible-jump Markov chain Monte Carlo. *The American Naturalist*, 167(6), 808–825. https://doi.org/10.1086/503444
