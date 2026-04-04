@@ -127,7 +127,7 @@ d = @pipe vals |>
     select(_, [:Language_ID, :Parameter_ID, :Value]) |>
     dropmissing |>
     filter(r -> r.Value ∈ ["0", "1", "2"], _) |>
-    transform(_, :Value => (v -> parse.(Int, v)) => :Value) |>
+    DataFrames.transform(_, :Value => (v -> parse.(Int, v)) => :Value) |>
     unstack(_, :Parameter_ID, :Value) |>
     dropmissing |>
     filter(r -> r.GB193 > 0, _)
