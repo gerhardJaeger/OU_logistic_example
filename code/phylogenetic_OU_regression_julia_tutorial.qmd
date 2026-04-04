@@ -730,10 +730,20 @@ Under the dependent model, all 8 off-diagonal rates are free. We use the same `r
     lr    = clamp.(log_r, -8.0, 8.0)
     rates = exp.(lr)
 
-    # rates_to_Q fills upper triangle then lower triangle, row-major:
-    # upper: r[1]=(0,0)→(0,1), r[2]=(0,0)→(1,0), r[3]=(0,1)→(1,1), r[4]=(1,0)→(1,1)
-    # lower: r[5]=(0,1)→(0,0), r[6]=(1,0)→(0,0), r[7]=(1,1)→(0,1), r[8]=(1,1)→(1,0)
-    Q    = rates_to_Q(rates, 4)
+    # Pagel's dependent model: only single-feature transitions (no double flips).
+    # States: 1=(0,0), 2=(0,1), 3=(1,0), 4=(1,1)
+    Q = zeros(eltype(rates), 4, 4)
+    Q[1, 2] = rates[1]  # (0,0)→(0,1)
+    Q[1, 3] = rates[2]  # (0,0)→(1,0)
+    Q[2, 4] = rates[3]  # (0,1)→(1,1)
+    Q[3, 4] = rates[4]  # (1,0)→(1,1)
+    Q[2, 1] = rates[5]  # (0,1)→(0,0)
+    Q[3, 1] = rates[6]  # (1,0)→(0,0)
+    Q[4, 2] = rates[7]  # (1,1)→(0,1)
+    Q[4, 3] = rates[8]  # (1,1)→(1,0)
+    for i in 1:4
+        Q[i, i] = -sum(Q[i, :])
+    end
     stat = try
         stationary_dist(Q)
     catch
