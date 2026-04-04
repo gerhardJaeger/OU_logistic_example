@@ -1035,7 +1035,7 @@ where $t_{l_1,l_2}$ is the patristic distance between languages $l_1$ and $l_2$,
 We implement this by simulating the bivariate OU process along the tree, using correlated innovations at each branch:
 
 ```{julia}
-@model function OU_correlation_single_tree(tree_info, taxa)
+@model function OU_correlation_single_tree(tree_info, taxa, x, y)
     root       = tree_info.root
     mothers    = tree_info.mothers
     daughters  = tree_info.daughters
@@ -1080,24 +1080,18 @@ We implement this by simulating the bivariate OU process along the tree, using c
         z[dgt, :] = mn .+ s .* z_cor[i, :]
     end
 
-    # Extract tip values
-    for (k, t) in enumerate(taxa)
-        x_k = d.x[k]
-        y_k = d.y[k]
-        node = nodes_dict[t]
-        x_k ~ BernoulliLogit(z[node, 1])
-        y_k ~ BernoulliLogit(z[node, 2])
-    end
+    # Observed tip values
+    x_logits = [z[nodes_dict[t], 1] for t in taxa]
+    y_logits = [z[nodes_dict[t], 2] for t in taxa]
+    x ~ product_distribution(BernoulliLogit.(x_logits))
+    y ~ product_distribution(BernoulliLogit.(y_logits))
 end
 ```
 
 ```{julia}
 Random.seed!(42)
 chain_OU_correlation = Turing.sample(
-    OU_correlation_single_tree(tree_info, taxa) | (
-        x = [d.x[k] for k in 1:nrow(d)],
-        y = [d.y[k] for k in 1:nrow(d)]
-    ),
+    OU_correlation_single_tree(tree_info, taxa, d.x, d.y),
     MH(),
     MCMCThreads(),
     100_000,
@@ -1129,7 +1123,7 @@ Since the HPD of $\rho$ includes 0, we conclude there is no credible evidence fo
 ```{julia}
 # Prior predictive
 prior_chain_ouc = Turing.sample(
-    OU_correlation_single_tree(tree_info, taxa),
+    OU_correlation_single_tree(tree_info, taxa, d.x, d.y),
     Prior(),
     length(chain_OU_correlation)
 )
@@ -1181,10 +1175,7 @@ println("LOOIC (OU correlation): ", loo_OU_correlation["looic"])
 ```
 
 ```{julia}
-model_ouc = OU_correlation_single_tree(tree_info, taxa) | (
-    x = [d.x[k] for k in 1:nrow(d)],
-    y = [d.y[k] for k in 1:nrow(d)]
-)
+model_ouc = OU_correlation_single_tree(tree_info, taxa, d.x, d.y)
 ldf_ouc = LogDensityFunction(model_ouc)
 params_ouc = Symbol.(keys(ldf_ouc.varinfo))
 params_1d_ouc = String[]
