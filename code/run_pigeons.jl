@@ -7,24 +7,32 @@
 
 cd(@__DIR__)
 
+using Dates
+println("[$(now())] Loading packages..."); flush(stdout)
 using CSV
 using DataFrames
 using Distributions
+println("[$(now())] CSV/DataFrames/Distributions done"); flush(stdout)
 using DynamicPPL
+println("[$(now())] DynamicPPL done"); flush(stdout)
 using ExponentialUtilities
 using LinearAlgebra
 using LogDensityProblems
 using Phylo
 using Random
 using RCall
+println("[$(now())] RCall done"); flush(stdout)
 using Statistics
 using StatsBase
 using StatsFuns
 using JLD2
 using Turing
+println("[$(now())] Turing done"); flush(stdout)
 using Pigeons
+println("[$(now())] Pigeons done"); flush(stdout)
 
 include("bridge_sampling.jl")
+println("[$(now())] bridge_sampling.jl included"); flush(stdout)
 
 # ─── Data loading ────────────────────────────────────────────────────────────
 
