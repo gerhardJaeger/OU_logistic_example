@@ -87,6 +87,13 @@ function bridge_sampling(
         log(n_1) - log(n_2) + lognumi - logdeni
     end
 
+    if verbose
+        println("  dim=$(d), n_post=$(n_post), n_prop=$(n_prop)")
+        println("  l1: mean=$(round(mean(l1),digits=2))  std=$(round(std(l1),digits=2))  min=$(round(minimum(l1),digits=2))  max=$(round(maximum(l1),digits=2))")
+        println("  l2: mean=$(round(mean(l2),digits=2))  std=$(round(std(l2),digits=2))  min=$(round(minimum(l2),digits=2))  max=$(round(maximum(l2),digits=2))")
+        println("  lstar=$(round(lstar,digits=2))  logdetL=$(round(logdetL,digits=2))")
+    end
+
     ft = optimize(y -> (upd(y) - y)^2, -1e6, 1e6)
     ft.minimizer + lstar
 end
