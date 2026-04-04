@@ -50,6 +50,8 @@ end
 R"""
 library(ape)
 .full_tree <- read.nexus($tree_file)
+.full_tree$tip.label <- sapply(strsplit(.full_tree$tip.label, "_"), `[`, 1)
+.full_tree$edge.length <- .full_tree$edge.length / mean(.full_tree$edge.length)
 """
 
 # Load pruned dataset directly — it was created by the notebook and already has x, y columns.
