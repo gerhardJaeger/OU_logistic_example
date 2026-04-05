@@ -286,11 +286,18 @@ else
         1_000,
         4
     )
-    describe(chain_vanilla_regression)
     mkpath("cache")
     jldsave(_cache_file; chain=chain_vanilla_regression)
     println("Saved chain_vanilla_regression to cache")
 end
+```
+
+```{julia}
+show(describe(chain_vanilla_regression))
+```
+
+```{julia}
+rhat(chain_vanilla_regression)
 ```
 
 ```{julia}
@@ -382,14 +389,16 @@ else
         1_000,
         4
     )
-    
-              if !occursin("z", string(nm)) && !occursin("_u", string(nm))]
     mkpath("cache")
     jldsave(_cache_file; chain=chain_vanilla_correlation)
     println("Saved chain_vanilla_correlation to cache")
 end
 nms_vc = [nm for nm in names(chain_vanilla_correlation) if !occursin("z", string(nm)) && !occursin("_u", string(nm))]
-describe(chain_vanilla_correlation[:, nms_vc, :])
+show(describe(chain_vanilla_correlation[:, nms_vc, :]))
+```
+
+```{julia}
+rhat(chain_vanilla_correlation[:, nms_vc, :])
 ```
 
 ```{julia}
@@ -718,11 +727,18 @@ else
         1_000,
         4
     )
-    describe(chain_ctmc_indep)
     mkpath("cache")
     jldsave(_cache_file; chain=chain_ctmc_indep)
     println("Saved chain_ctmc_indep to cache")
 end
+```
+
+```{julia}
+show(describe(chain_ctmc_indep))
+```
+
+```{julia}
+rhat(chain_ctmc_indep)
 ```
 
 ```{julia}
@@ -801,11 +817,18 @@ else
         1_000,
         4
     )
-    describe(chain_ctmc_dep)
     mkpath("cache")
     jldsave(_cache_file; chain=chain_ctmc_dep)
     println("Saved chain_ctmc_dep to cache")
 end
+```
+
+```{julia}
+show(describe(chain_ctmc_dep))
+```
+
+```{julia}
+rhat(chain_ctmc_dep)
 ```
 
 ```{julia}
@@ -920,14 +943,16 @@ else
         1_000,
         4
     )
-    
-               if !occursin("z_std", string(nm)) && !occursin("_u", string(nm))]
     mkpath("cache")
     jldsave(_cache_file; chain=chain_OU_regression)
     println("Saved chain_OU_regression to cache")
 end
 nms_our = [nm for nm in names(chain_OU_regression) if !occursin("z_std", string(nm)) && !occursin("_u", string(nm))]
-describe(chain_OU_regression[:, nms_our, :])
+show(describe(chain_OU_regression[:, nms_our, :]))
+```
+
+```{julia}
+rhat(chain_OU_regression[:, nms_our, :])
 ```
 
 ```{julia}
@@ -986,6 +1011,9 @@ println("LOOIC (OU regression): ", loo_OU_regression["looic"])
 
 ```{julia}
 # Bridge sampling
+# Note: bridge sampling can underestimate the marginal likelihood for models with many
+# latent variables (here: ~100 OU latent states). For a more reliable estimate via
+# thermodynamic integration, see run_pigeons.jl, which uses Pigeons.jl stepping-stone.
 model_our = OU_regression(d, tree_info, taxa)
 ldf_our = LogDensityFunction(model_our)
 samples_our = stochastic_samples(chain_OU_regression, ldf_our)
@@ -1041,14 +1069,16 @@ else
         1_000,
         4
     )
-    
-              if !occursin("z", string(nm)) && !occursin("_u", string(nm))]
     mkpath("cache")
     jldsave(_cache_file; chain=chain_brownian_regression)
     println("Saved chain_brownian_regression to cache")
 end
 nms_br = [nm for nm in names(chain_brownian_regression) if !occursin("z", string(nm)) && !occursin("_u", string(nm))]
-describe(chain_brownian_regression[:, nms_br, :])
+show(describe(chain_brownian_regression[:, nms_br, :]))
+```
+
+```{julia}
+rhat(chain_brownian_regression[:, nms_br, :])
 ```
 
 ```{julia}
@@ -1165,20 +1195,21 @@ else
         1_000,
         4
     )
-    
-               if !occursin("z", string(nm)) && !occursin("_u", string(nm)) &&
-                  !occursin("root_states", string(nm))]
     mkpath("cache")
     jldsave(_cache_file; chain=chain_OU_correlation)
     println("Saved chain_OU_correlation to cache")
 end
 nms_ouc = [nm for nm in names(chain_OU_correlation) if !occursin("z", string(nm)) && !occursin("_u", string(nm)) && !occursin("root_states", string(nm))]
-describe(chain_OU_correlation[:, nms_ouc, :])
+show(describe(chain_OU_correlation[:, nms_ouc, :]))
 ```
 
 ```{julia}
 hpd(chain_OU_correlation[:, ["mu[1]", "mu[2]", "sigma[1]", "sigma[2]",
                                "lambda[1]", "lambda[2]", "rho"], :])
+```
+
+```{julia}
+rhat(chain_OU_correlation[:, nms_ouc, :])
 ```
 
 ```{julia}
@@ -1293,14 +1324,12 @@ else
         1_000,
         4
     )
-    
-              if !occursin("z", string(nm)) && !occursin("_u", string(nm))]
     mkpath("cache")
     jldsave(_cache_file; chain=chain_brownian_correlation)
     println("Saved chain_brownian_correlation to cache")
 end
 nms_bc = [nm for nm in names(chain_brownian_correlation) if !occursin("z", string(nm)) && !occursin("_u", string(nm))]
-describe(chain_brownian_correlation[:, nms_bc, :])
+show(describe(chain_brownian_correlation[:, nms_bc, :]))
 ```
 
 ```{julia}
@@ -1329,10 +1358,12 @@ println("Log BF (OU correlation vs Brownian correlation): ",
 
 ## Final comparison
 
-### Bayes factors
+### Bayes factors (bridge sampling)
+
+Bridge sampling gives reliable marginal likelihood estimates for models with a small number of parameters. For models with many latent variables — OU regression has ~100 latent OU states, the correlation models have ~200 — the proposal distribution in bridge sampling stops overlapping the posterior and the estimates can be substantially off. For those models, the stepping-stone estimates from `run_pigeons.jl` (Pigeons.jl) should be preferred; see the next section.
 
 ```{julia}
-println("=== Log marginal likelihoods ===")
+println("=== Log marginal likelihoods (bridge sampling) ===")
 println("Vanilla regression:      ", logml_vanilla_regression)
 println("Vanilla correlation:     ", logml_vanilla_correlation)
 println("CTMC independent:        ", logml_ctmc_indep)
@@ -1341,50 +1372,98 @@ println("Brownian regression:     ", logml_brownian_regression)
 println("Brownian correlation:    ", logml_brownian_correlation)
 println("OU regression:           ", logml_OU_regression)
 println("OU correlation:          ", logml_OU_correlation)
-
-println()
-println("=== Key Bayes factors (log scale) ===")
-println("OU correlation vs CTMC independent:     ", logml_OU_correlation - logml_ctmc_indep)
-println("OU correlation vs Brownian correlation: ", logml_OU_correlation - logml_brownian_correlation)
-println("OU regression vs Brownian regression:   ", logml_OU_regression - logml_brownian_regression)
-println("OU regression vs vanilla regression:    ", logml_OU_regression - logml_vanilla_regression)
 ```
 
+### Bayes factors (Pigeons stepping-stone)
+
+Thermodynamic integration via Pigeons.jl's `stepping_stone` estimator is reliable for high-dimensional posteriors. Pre-computed values are loaded from `cache/pigeons_*.jld2` (produced by `run_pigeons.jl`).
+
+```{julia}
+pigeons_logmls = Dict(
+    "vanilla_regression"   => load("cache/pigeons_vanilla_regression.jld2",   "logml"),
+    "vanilla_correlation"  => load("cache/pigeons_vanilla_correlation.jld2",  "logml"),
+    "ctmc_indep"           => load("cache/pigeons_ctmc_indep.jld2",           "logml"),
+    "ctmc_dep"             => load("cache/pigeons_ctmc_dep.jld2",             "logml"),
+    "brownian_regression"  => load("cache/pigeons_brownian_regression.jld2",  "logml"),
+    "brownian_correlation" => load("cache/pigeons_brownian_correlation.jld2", "logml"),
+    "OU_regression"        => load("cache/pigeons_OU_regression.jld2",        "logml"),
+    "OU_correlation"       => load("cache/pigeons_OU_correlation.jld2",       "logml"),
+)
+
+println("=== Log marginal likelihoods (Pigeons stepping-stone) ===")
+for (k, v) in sort(collect(pigeons_logmls), by=x->x[2], rev=true)
+    @printf("  %-24s %8.2f\n", k, v)
+end
+
+println()
+println("=== Key Bayes factors (log scale, Pigeons) ===")
+@printf("  OU regression vs vanilla regression:    %+.2f\n",
+    pigeons_logmls["OU_regression"] - pigeons_logmls["vanilla_regression"])
+@printf("  OU regression vs Brownian regression:   %+.2f\n",
+    pigeons_logmls["OU_regression"] - pigeons_logmls["brownian_regression"])
+@printf("  OU correlation vs vanilla correlation:  %+.2f\n",
+    pigeons_logmls["OU_correlation"] - pigeons_logmls["vanilla_correlation"])
+@printf("  OU correlation vs Brownian correlation: %+.2f\n",
+    pigeons_logmls["OU_correlation"] - pigeons_logmls["brownian_correlation"])
+@printf("  OU correlation vs CTMC independent:     %+.2f\n",
+    pigeons_logmls["OU_correlation"] - pigeons_logmls["ctmc_indep"])
+@printf("  CTMC independent vs CTMC dependent:     %+.2f\n",
+    pigeons_logmls["ctmc_indep"] - pigeons_logmls["ctmc_dep"])
+```
+
+```{julia}
+# Summary table: bridge sampling vs Pigeons
+bf_table = DataFrame(
+    model = ["Vanilla regression", "Vanilla correlation", "CTMC independent", "CTMC dependent",
+             "Brownian regression", "Brownian correlation", "OU regression", "OU correlation"],
+    bridge = [logml_vanilla_regression, logml_vanilla_correlation,
+              logml_ctmc_indep, logml_ctmc_dep,
+              logml_brownian_regression, logml_brownian_correlation,
+              logml_OU_regression, logml_OU_correlation],
+    pigeons = [pigeons_logmls["vanilla_regression"], pigeons_logmls["vanilla_correlation"],
+               pigeons_logmls["ctmc_indep"], pigeons_logmls["ctmc_dep"],
+               pigeons_logmls["brownian_regression"], pigeons_logmls["brownian_correlation"],
+               pigeons_logmls["OU_regression"], pigeons_logmls["OU_correlation"]],
+)
+bf_table.diff = bf_table.pigeons .- bf_table.bridge
+bf_table
+```
+
+The bridge and Pigeons estimates agree well for simple models (vanilla, CTMC) and diverge for models with many latents (OU, Brownian correlation), confirming that Pigeons values should be used for the final model comparison.
+
 ### LOO comparison
+
+CTMC models do not admit a standard per-observation log-likelihood decomposition — the CTMC likelihood is defined over the joint tip configuration, not individual languages — so LOO is not applicable to them.
 
 ```{julia}
 loo_results = DataFrame(
     model = [
-        "vanilla_regression",
-        "vanilla_correlation",
-        "CTMC_independent",
-        "CTMC_dependent",
+        "OU_regression",
+        "OU_correlation",
         "brownian_regression",
         "brownian_correlation",
-        "OU_regression",
-        "OU_correlation"
+        "vanilla_regression",
+        "vanilla_correlation",
     ],
     LOOIC = [
-        loo_vanilla_regression["looic"],
-        loo_vanilla_correlation["looic"],
-        NaN,   # computed separately in R if needed
-        NaN,
+        loo_OU_regression["looic"],
+        loo_OU_correlation["looic"],
         loo_brownian_regression["looic"],
         loo_brownian_correlation["looic"],
-        loo_OU_regression["looic"],
-        loo_OU_correlation["looic"]
+        loo_vanilla_regression["looic"],
+        loo_vanilla_correlation["looic"],
     ]
 )
 
-sort!(dropmissing(loo_results, :LOOIC), :LOOIC)
+sort!(loo_results, :LOOIC)
 ```
 
 Pareto-smoothed leave-one-out cross-validation and Bayes factors measure different things:
 
-- The **Bayes Factor** evaluates the joint model of both variables together. A model that fits the joint distribution better — capturing how $x$ and $y$ co-evolve — will be favored.
-- The **LOOIC** measures predictive accuracy for $y$ alone, given $x$. The CTMC models, despite their coarser representation, can make relatively sharp predictions about individual left-out languages.
+- The **Bayes factor** evaluates the full generative model (both variables). A model that better captures the joint evolutionary process is favored.
+- The **LOOIC** measures predictive accuracy for $y$ alone. It rewards models that assign high probability to each held-out observation of $y$.
 
-The results are consistent: continuous latent-variable models substantially outperform CTMC. Among the continuous models, OU outperforms Brownian motion.
+Both metrics agree: continuous latent-variable models substantially outperform the vanilla baselines, and OU outperforms Brownian motion.
 
 **Practical recommendation:** For binary typological features, the OU correlation model is the preferred choice when the research question concerns co-evolution or correlation. The OU regression model is appropriate when the question is directional. In both cases the Turing.jl implementation is straightforward to adapt to other feature pairs, other phylogenies, or additional random effects (geographic, family-level, etc.).
 
