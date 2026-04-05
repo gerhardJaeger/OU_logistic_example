@@ -271,6 +271,7 @@ function LogDensityProblems.logdensity(d::CTMCIndepLogDensity, log_r::AbstractVe
 end
 LogDensityProblems.dimension(::CTMCIndepLogDensity) = 4
 LogDensityProblems.capabilities(::Type{CTMCIndepLogDensity}) = LogDensityProblems.LogDensityOrder{0}()
+(d::CTMCIndepLogDensity)(x) = LogDensityProblems.logdensity(d, x)
 
 struct CTMCDepLogDensity
     tip_states::Vector{Int}
@@ -291,6 +292,7 @@ function LogDensityProblems.logdensity(d::CTMCDepLogDensity, log_r::AbstractVect
 end
 LogDensityProblems.dimension(::CTMCDepLogDensity) = 8
 LogDensityProblems.capabilities(::Type{CTMCDepLogDensity}) = LogDensityProblems.LogDensityOrder{0}()
+(d::CTMCDepLogDensity)(x) = LogDensityProblems.logdensity(d, x)
 
 # Pigeons needs a reference distribution with sample_iid! support.
 # DistributionLogPotential wraps a Distributions.jl type and provides both
