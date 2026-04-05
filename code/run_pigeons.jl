@@ -298,6 +298,8 @@ LogDensityProblems.capabilities(::Type{CTMCDepLogDensity}) = LogDensityProblems.
 # log_r ~ MvNormal(zeros, I) prior exactly, so stepping_stone = log p(data).
 Pigeons.default_reference(::CTMCIndepLogDensity) = Pigeons.DistributionLogPotential(MvNormal(zeros(4), I))
 Pigeons.default_reference(::CTMCDepLogDensity)   = Pigeons.DistributionLogPotential(MvNormal(zeros(8), I))
+Pigeons.initialization(::CTMCIndepLogDensity, rng, _) = randn(rng, 4)
+Pigeons.initialization(::CTMCDepLogDensity,   rng, _) = randn(rng, 8)
 
 @model function OU_regression(d, tree_info, taxa)
     N = length(taxa)
