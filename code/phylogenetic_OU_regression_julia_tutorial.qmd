@@ -585,6 +585,67 @@ function pruning_loglik(
 end
 ```
 
+```{julia}
+"""
+    ctmc_loo_loglik(chain, tip_states, ctmc_tree, d, n_rates)
+
+Exact leave-one-out log-likelihoods for a CTMC model. For each posterior
+sample and each tip, runs Felsenstein pruning with the tip marginalized,
+then returns log P(y_i | x_i, all other tips, parameters). This mirrors
+the `generated quantities` computation in the Stan CTMC models.
+
+`n_rates`: 4 for the independent model, 8 for the dependent model.
+"""
+function ctmc_loo_loglik(chain, tip_states, ctmc_tree, d, n_rates)
+    var_names = chain.name_map[:parameters]
+    raw = chain.value.data  # (iters × vars × nchains)
+    n_iter, _, n_chains = size(raw)
+    N_samples = n_iter * n_chains
+    N_tips = ctmc_tree.n_tips
+
+    log_r_idx = [findfirst(==(Symbol("log_r[$i]")), var_names) for i in 1:n_rates]
+
+    loglik = zeros(N_samples, N_tips)
+
+    @threads for s_idx in 1:N_samples
+        ch = div(s_idx - 1, n_iter) + 1
+        it = mod(s_idx - 1, n_iter) + 1
+
+        lr = clamp.([raw[it, log_r_idx[i], ch] for i in 1:n_rates], -8.0, 8.0)
+
+        Q = zeros(4, 4)
+        if n_rates == 4
+            q_y0, q_y1, q_x0, q_x1 = exp.(lr)
+            Q[1,2]=q_y0; Q[2,1]=q_y1; Q[3,4]=q_y0; Q[4,3]=q_y1
+            Q[1,3]=q_x0; Q[3,1]=q_x1; Q[2,4]=q_x0; Q[4,2]=q_x1
+        else
+            r = exp.(lr)
+            Q[1,2]=r[1]; Q[1,3]=r[2]; Q[2,4]=r[3]; Q[3,4]=r[4]
+            Q[2,1]=r[5]; Q[3,1]=r[6]; Q[4,2]=r[7]; Q[4,3]=r[8]
+        end
+        for i in 1:4; Q[i,i] = -sum(Q[i,:]); end
+        stat = stationary_dist(Q)
+
+        ts_mod = copy(tip_states)
+        for tip in 1:N_tips
+            ll_s = zeros(4)
+            x_tip = d.x[tip]
+            for s in 1:4
+                ts_mod[tip] = s
+                ll_s[s] = pruning_loglik(ts_mod, ctmc_tree.edges, ctmc_tree.lengths,
+                    ctmc_tree.root_node, ctmc_tree.n_nodes, ctmc_tree.n_tips, Q, stat)
+            end
+            ts_mod[tip] = tip_states[tip]  # restore
+
+            obs   = tip_states[tip]                 # 2*x + y + 1
+            alt   = 2 * x_tip + (1 - d.y[tip]) + 1 # same x, flipped y
+            loglik[s_idx, tip] = ll_s[obs] - logaddexp(ll_s[obs], ll_s[alt])
+        end
+    end
+    return loglik
+end
+```
+
 ### Encode tree for CTMC models
 
 ```{julia}
@@ -850,6 +911,22 @@ if bf_ctmc > 0
 else
     println("Evidence favors the DEPENDENT model (correlated evolution).")
 end
+```
+
+### LOO for CTMC models
+
+The CTMC likelihood is defined over the joint tip configuration, not as a product of per-observation terms, so PSIS-LOO is not directly applicable. However, exact leave-one-out log-likelihoods can be computed by re-running Felsenstein pruning for each tip in turn (marginalizing over its state). This is analogous to the `generated quantities` block in the Stan CTMC models. The resulting per-tip log-likelihoods are then passed to `loo()`.
+
+```{julia}
+loglik_ctmc_indep = ctmc_loo_loglik(chain_ctmc_indep, tip_states_obs, ctmc_tree, d, 4)
+loo_ctmc_indep = convert(Dict, R"library(loo); loo($(loglik_ctmc_indep))")
+println("LOOIC (CTMC independent): ", loo_ctmc_indep["looic"])
+```
+
+```{julia}
+loglik_ctmc_dep = ctmc_loo_loglik(chain_ctmc_dep, tip_states_obs, ctmc_tree, d, 8)
+loo_ctmc_dep = convert(Dict, R"library(loo); loo($(loglik_ctmc_dep))")
+println("LOOIC (CTMC dependent): ", loo_ctmc_dep["looic"])
 ```
 
 The CTMC approach has one fundamental limitation: it treats typological features as discrete characters with a small number of states. This ignores the gradient nature of typological tendencies. We now turn to continuous models.
@@ -1433,13 +1510,13 @@ The bridge and Pigeons estimates agree well for simple models (vanilla, CTMC) an
 
 ### LOO comparison
 
-CTMC models do not admit a standard per-observation log-likelihood decomposition — the CTMC likelihood is defined over the joint tip configuration, not individual languages — so LOO is not applicable to them.
-
 ```{julia}
 loo_results = DataFrame(
     model = [
         "OU_regression",
         "OU_correlation",
+        "CTMC_independent",
+        "CTMC_dependent",
         "brownian_regression",
         "brownian_correlation",
         "vanilla_regression",
@@ -1448,6 +1525,8 @@ loo_results = DataFrame(
     LOOIC = [
         loo_OU_regression["looic"],
         loo_OU_correlation["looic"],
+        loo_ctmc_indep["looic"],
+        loo_ctmc_dep["looic"],
         loo_brownian_regression["looic"],
         loo_brownian_correlation["looic"],
         loo_vanilla_regression["looic"],
@@ -1462,6 +1541,8 @@ Pareto-smoothed leave-one-out cross-validation and Bayes factors measure differe
 
 - The **Bayes factor** evaluates the full generative model (both variables). A model that better captures the joint evolutionary process is favored.
 - The **LOOIC** measures predictive accuracy for $y$ alone. It rewards models that assign high probability to each held-out observation of $y$.
+
+Note that for the CTMC models, LOO is computed exactly (by re-running Felsenstein pruning with each tip marginalized) rather than via PSIS. For the continuous models it is computed via PSIS on the per-observation log-likelihoods. Despite the different computation strategies, `loo()` treats both identically for comparison.
 
 Both metrics agree: continuous latent-variable models substantially outperform the vanilla baselines, and OU outperforms Brownian motion.
 
