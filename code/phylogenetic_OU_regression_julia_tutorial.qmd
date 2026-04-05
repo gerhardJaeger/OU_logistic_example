@@ -238,7 +238,7 @@ function get_vcv(tree; taxa=taxa)
     return vcv[indexin(tip_names, taxa), indexin(tip_names, taxa)]
 end
 
-scaled_vcv = get_vcv(edge_tree) ./ 100
+scaled_vcv = get_vcv(edge_tree) ./ 100  # divide by N (= 100 languages) so rate ~ LogNormal(0,1) is calibrated for logistic-scale outputs
 scaled_chol = cholesky(scaled_vcv).L
 ```
 
@@ -462,39 +462,14 @@ We implement Felsenstein's pruning algorithm in Julia directly.
 
 The joint state encoding is: $\text{state} = 2x + y + 1 \in \{1,2,3,4\}$.
 
-### Helper functions: rate matrix, stationary distribution, and Felsenstein pruning
+### Helper functions: stationary distribution and Felsenstein pruning
 
-The reference implementation separates three concerns: (1) building the $Q$ matrix from a vector of raw rates, (2) computing the stationary distribution via a linear solve, and (3) the pruning recursion itself. This factoring keeps each piece reusable and makes the Turing model definitions clean.
+The two shared helpers are (1) computing the stationary distribution of $Q$ via a linear solve, and (2) the Felsenstein pruning recursion. The $Q$ matrix is built directly inside each Turing model, where the independence constraints (or their absence) are most clearly expressed.
 
 ```{julia}
 const N_STATES_CTMC = 4
 const N_RATES_INDEP = 4   # independent model
 const N_RATES_DEP   = 8   # dependent model
-
-"""
-    rates_to_Q(rates, n_states)
-
-Build a rate matrix Q from a vector of raw (positive) off-diagonal rates.
-Rates are filled row-major upper triangle then lower triangle.
-For the 4-state CTMC the layout matches the Pagel & Meade ordering:
-  upper: (0,0)→(0,1), (0,0)→(1,0), (0,1)→(1,1), (1,0)→(1,1)
-  lower: (0,1)→(0,0), (1,0)→(0,0), (1,1)→(0,1), (1,1)→(1,0)
-The diagonal is set so that each row sums to zero.
-"""
-function rates_to_Q(rates::AbstractVector{T}, n::Int) where T <: Real
-    Q = zeros(T, n, n)
-    k = 1
-    for i in 1:n, j in (i+1):n
-        Q[i, j] = rates[k]; k += 1
-    end
-    for i in 2:n, j in 1:(i-1)
-        Q[i, j] = rates[k]; k += 1
-    end
-    for i in 1:n
-        Q[i, i] = -sum(Q[i, :])
-    end
-    return Q
-end
 
 """
     stationary_dist(Q)
@@ -712,7 +687,7 @@ println("Observed state distribution: ", countmap(tip_states_obs))
 
 ### Independent CTMC model
 
-Under independence, the joint process on $(x, y)$ factorizes: the rate of transitioning in $x$ does not depend on the current value of $y$, and vice versa. This imposes four equality constraints on the 8 off-diagonal rates, leaving 4 free parameters. Using the `rates_to_Q` helper, the independent model is parameterized by 4 log-rates with a Normal(0,1) prior — equivalently a LogNormal(0,1) prior on the raw rates.
+Under independence, the joint process on $(x, y)$ factorizes: the rate of transitioning in $x$ does not depend on the current value of $y$, and vice versa. This imposes four equality constraints on the 8 off-diagonal rates, leaving 4 free parameters. The independent model is parameterized by 4 log-rates with a Normal(0,1) prior — equivalently a LogNormal(0,1) prior on the raw rates.
 
 ```{julia}
 @model function ctmc_independent(tip_states, ctmc_tree)
@@ -805,6 +780,10 @@ rhat(chain_ctmc_indep)
 ```
 
 ```{julia}
+plot(chain_ctmc_indep, size=(700, 500))
+```
+
+```{julia}
 # Bridge sampling for marginal likelihood
 model_ctmc_indep = ctmc_independent(tip_states_obs, ctmc_tree)
 ldf_ctmc_indep = LogDensityFunction(model_ctmc_indep)
@@ -816,7 +795,7 @@ println("Log marginal likelihood (CTMC independent): ", logml_ctmc_indep)
 
 ### Dependent CTMC model
 
-Under the dependent model, all 8 off-diagonal rates are free. We use the same `rates_to_Q` helper with 8 log-rates (Normal(0,1) prior), and the same pruning algorithm. The only difference is the prior is over 8 parameters rather than 4.
+Under the dependent model, all 8 off-diagonal rates are free. We use 8 log-rates (Normal(0,1) prior) and the same pruning algorithm; the only difference from the independent model is the number of free parameters.
 
 ```{julia}
 @model function ctmc_dependent(tip_states, ctmc_tree)
@@ -895,6 +874,10 @@ rhat(chain_ctmc_dep)
 ```
 
 ```{julia}
+plot(chain_ctmc_dep, size=(700, 600))
+```
+
+```{julia}
 model_ctmc_dep = ctmc_dependent(tip_states_obs, ctmc_tree)
 ldf_ctmc_dep = LogDensityFunction(model_ctmc_dep)
 samples_cd = stochastic_samples(chain_ctmc_dep, ldf_ctmc_dep)
@@ -926,6 +909,9 @@ $$
 where $s_t^{x,y}$ denotes the joint state $(x_t, y)$. Each of the three terms is a Felsenstein pruning likelihood with tip $t$ forced to a particular state; the $p(D_{-t} \mid Q)$ factor cancels in the ratio. This mirrors the `generated quantities` block in the Stan CTMC models. The resulting per-tip log-likelihoods are passed to `loo()`.
 
 ```{julia}
+# Warning: ctmc_loo_loglik runs Felsenstein pruning 4× per tip per posterior sample.
+# With 4000 samples × 100 tips × 4 pruning calls, this may take 15–30 minutes
+# even with multithreading. Consider reducing the chain length during development.
 loglik_ctmc_indep = ctmc_loo_loglik(chain_ctmc_indep, tip_states_obs, ctmc_tree, d, 4)
 loo_ctmc_indep = convert(Dict, R"library(loo); loo($(loglik_ctmc_indep))")
 println("LOOIC (CTMC independent): ", loo_ctmc_indep["looic"])
@@ -939,7 +925,92 @@ println("LOOIC (CTMC dependent): ", loo_ctmc_dep["looic"])
 
 The CTMC approach has one fundamental limitation: it treats typological features as discrete characters with a small number of states. This ignores the gradient nature of typological tendencies. We now turn to continuous models.
 
-## Logistic regression with a phylogenetic random effect
+## Brownian motion regression (baseline)
+
+Brownian motion is the $\lambda \to 0$ limit of the OU process. As a baseline, it captures phylogenetic covariance without mean-reversion — a comparison of OU vs. Brownian therefore directly tests whether stabilizing selection improves the fit, over and above phylogenetic control alone. The model is implemented via the precomputed Cholesky factor of the phylogenetic variance-covariance matrix (VCV):
+
+$$
+\begin{align}
+\epsilon &\sim \mathcal N(0, \sigma^2 \cdot \text{VCV})\\
+y_i &\sim \text{Bernoulli}(\text{logit}^{-1}(\alpha + \beta x_i + \epsilon_i))
+\end{align}
+$$
+
+The VCV Cholesky parameterization is convenient for Brownian motion because no per-edge decay factor is needed. The OU model below uses forward simulation along the tree instead — both are mathematically equivalent for Brownian motion, but forward simulation extends naturally to OU without requiring a matrix inverse.
+
+```{julia}
+@model function brownian_regression(d, scaled_chol, taxa)
+    N = length(taxa)
+    alpha ~ LocationScale(0.0, 2.5, TDist(3))
+    beta  ~ Normal(0, 2)
+    rate_u ~ Normal(0, 1)
+    rate := exp(rate_u)
+
+    z_std ~ filldist(Normal(), N)
+    z := rate .* (scaled_chol * z_std)
+
+    x_c = d.x .- mean(d.x)
+    for i in 1:N
+        d.y[i] ~ BernoulliLogit(alpha + beta * x_c[i] + z[i])
+    end
+end
+```
+
+```{julia}
+_cache_file = "cache/chain_brownian_regression.jld2"
+if isfile(_cache_file)
+    chain_brownian_regression = load(_cache_file, "chain")
+    println("Loaded chain_brownian_regression from cache")
+else
+    Random.seed!(42)
+    chain_brownian_regression = Turing.sample(
+        brownian_regression(d, scaled_chol, taxa),
+        NUTS(0.95),
+        MCMCThreads(),
+        1_000,
+        4
+    )
+    mkpath("cache")
+    jldsave(_cache_file; chain=chain_brownian_regression)
+    println("Saved chain_brownian_regression to cache")
+end
+nms_br = [nm for nm in names(chain_brownian_regression) if !occursin("z", string(nm)) && !occursin("_u", string(nm))]
+show(describe(chain_brownian_regression[:, nms_br, :]))
+```
+
+```{julia}
+rhat(chain_brownian_regression[:, nms_br, :])
+```
+
+```{julia}
+# LOO and bridge sampling for brownian regression
+loglik_brownian_regression = hcat([begin
+    z_vals = Array(chain_brownian_regression[:, "z[$i]", :])
+    x_c = d.x .- mean(d.x)
+    logpdf.(BernoulliLogit.(
+        Array(chain_brownian_regression[:, :alpha, :]) .+
+        Array(chain_brownian_regression[:, :beta, :]) .* x_c[i] .+
+        z_vals
+    ), d.y[i])
+end for i in 1:nrow(d)]...)
+
+loo_brownian_regression = convert(
+    Dict,
+    R"library(loo); loo($(loglik_brownian_regression))"
+)
+println("LOOIC (Brownian regression): ", loo_brownian_regression["looic"])
+```
+
+```{julia}
+model_br = brownian_regression(d, scaled_chol, taxa)
+ldf_br = LogDensityFunction(model_br)
+samples_br = stochastic_samples(chain_brownian_regression, ldf_br)
+f_br(x) = LogDensityProblems.logdensity(ldf_br, x)
+logml_brownian_regression = bridge_sampling(samples_br, f_br)
+println("Log marginal likelihood (Brownian regression): ", logml_brownian_regression)
+```
+
+## OU regression
 
 ### The Ornstein-Uhlenbeck process
 
@@ -967,7 +1038,7 @@ y_i &\sim \text{Bernoulli}(\text{logit}^{-1}(\alpha + \beta x_i + \epsilon_i))
 \end{align}
 $$
 
-Rather than inverting a covariance matrix, we simulate the OU process node by node along the tree, starting from the root and propagating downward. This is equivalent to the covariance parameterization but is more efficient and easier to extend.
+We simulate the OU process node by node along the tree, starting from the root and propagating downward (forward simulation). This avoids inverting the covariance matrix, is more efficient, and extends naturally to the bivariate case.
 
 ```{julia}
 @model function OU_regression(d, tree_info, taxa)
@@ -1107,96 +1178,11 @@ logml_OU_regression = bridge_sampling(samples_our, f_our)
 println("Log marginal likelihood (OU regression): ", logml_OU_regression)
 println("Log BF (OU regression vs vanilla regression): ",
     logml_OU_regression - logml_vanilla_regression)
-```
-
-This is strong evidence in favor of the OU model over the vanilla regression.
-
-### Brownian motion regression (baseline)
-
-Brownian motion is the $\lambda \to 0$ limit of OU. We implement it using the precomputed Cholesky factor of the phylogenetic covariance matrix (VCV matrix).
-
-$$
-\begin{align}
-\epsilon &\sim \mathcal N(0, \sigma^2 \cdot \text{VCV})\\
-y_i &\sim \text{Bernoulli}(\text{logit}^{-1}(\alpha + \beta x_i + \epsilon_i))
-\end{align}
-$$
-
-```{julia}
-@model function brownian_regression(d, scaled_chol, taxa)
-    N = length(taxa)
-    alpha ~ LocationScale(0.0, 2.5, TDist(3))
-    beta  ~ Normal(0, 2)
-    rate_u ~ Normal(0, 1)
-    rate := exp(rate_u)
-
-    z_std ~ filldist(Normal(), N)
-    z := rate .* (scaled_chol * z_std)
-
-    x_c = d.x .- mean(d.x)
-    for i in 1:N
-        d.y[i] ~ BernoulliLogit(alpha + beta * x_c[i] + z[i])
-    end
-end
-```
-
-```{julia}
-_cache_file = "cache/chain_brownian_regression.jld2"
-if isfile(_cache_file)
-    chain_brownian_regression = load(_cache_file, "chain")
-    println("Loaded chain_brownian_regression from cache")
-else
-    Random.seed!(42)
-    chain_brownian_regression = Turing.sample(
-        brownian_regression(d, scaled_chol, taxa),
-        NUTS(0.95),
-        MCMCThreads(),
-        1_000,
-        4
-    )
-    mkpath("cache")
-    jldsave(_cache_file; chain=chain_brownian_regression)
-    println("Saved chain_brownian_regression to cache")
-end
-nms_br = [nm for nm in names(chain_brownian_regression) if !occursin("z", string(nm)) && !occursin("_u", string(nm))]
-show(describe(chain_brownian_regression[:, nms_br, :]))
-```
-
-```{julia}
-rhat(chain_brownian_regression[:, nms_br, :])
-```
-
-```{julia}
-# LOO and bridge sampling for brownian regression
-loglik_brownian_regression = hcat([begin
-    z_vals = Array(chain_brownian_regression[:, "z[$i]", :])
-    x_c = d.x .- mean(d.x)
-    logpdf.(BernoulliLogit.(
-        Array(chain_brownian_regression[:, :alpha, :]) .+
-        Array(chain_brownian_regression[:, :beta, :]) .* x_c[i] .+
-        z_vals
-    ), d.y[i])
-end for i in 1:nrow(d)]...)
-
-loo_brownian_regression = convert(
-    Dict,
-    R"library(loo); loo($(loglik_brownian_regression))"
-)
-println("LOOIC (Brownian regression): ", loo_brownian_regression["looic"])
-```
-
-```{julia}
-model_br = brownian_regression(d, scaled_chol, taxa)
-ldf_br = LogDensityFunction(model_br)
-samples_br = stochastic_samples(chain_brownian_regression, ldf_br)
-f_br(x) = LogDensityProblems.logdensity(ldf_br, x)
-logml_brownian_regression = bridge_sampling(samples_br, f_br)
-println("Log marginal likelihood (Brownian regression): ", logml_brownian_regression)
-println("Log BF (OU vs Brownian regression): ",
+println("Log BF (OU regression vs Brownian regression): ",
     logml_OU_regression - logml_brownian_regression)
 ```
 
-The OU model is favored over Brownian motion — mean-reversion provides a genuinely better fit.
+The OU regression is strongly favored over both baselines. The Brownian comparison is the more informative one: since both models have identical phylogenetic structure, the Bayes factor directly quantifies the contribution of mean-reversion.
 
 ## Bivariate OU correlation model
 
@@ -1376,7 +1362,7 @@ Again we find strong evidence in favor of the phylogenetic model.
 
 ## Brownian motion correlation model
 
-For completeness, we also fit the Brownian motion correlation model using the VCV matrix.
+The Brownian motion correlation model provides the decisive comparison for the correlation models: if OU correlation outperforms Brownian correlation, the improvement cannot be attributed to phylogenetic structure per se — it specifically reflects the mean-reversion term. Brownian motion ($\lambda \to 0$) is the degenerate limit where both traits drift without bound; the Bayes factor between the two models directly quantifies how much stabilizing selection contributes beyond shared ancestry. We implement it via the VCV Cholesky, as in the Brownian regression above.
 
 ```{julia}
 @model function brownian_correlation_single(N, scaled_chol)
@@ -1415,6 +1401,14 @@ else
 end
 nms_bc = [nm for nm in names(chain_brownian_correlation) if !occursin("z", string(nm)) && !occursin("_u", string(nm))]
 show(describe(chain_brownian_correlation[:, nms_bc, :]))
+```
+
+```{julia}
+rhat(chain_brownian_correlation[:, nms_bc, :])
+```
+
+```{julia}
+plot(chain_brownian_correlation[:, nms_bc, :], size=(700, 400))
 ```
 
 ```{julia}
