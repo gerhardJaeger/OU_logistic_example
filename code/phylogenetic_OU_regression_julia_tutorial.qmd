@@ -589,10 +589,12 @@ end
 """
     ctmc_loo_loglik(chain, tip_states, ctmc_tree, d, n_rates)
 
-Exact leave-one-out log-likelihoods for a CTMC model. For each posterior
-sample and each tip, runs Felsenstein pruning with the tip marginalized,
-then returns log P(y_i | x_i, all other tips, parameters). This mirrors
-the `generated quantities` computation in the Stan CTMC models.
+Exact conditional LOO log-likelihoods for a CTMC model. For each posterior
+sample and each tip t, evaluates the Felsenstein likelihood with tip t
+forced to each of its 4 possible states, then computes
+log P(y_t | x_t, D_{-t}, params) as the log-ratio of joint likelihoods.
+The p(D_{-t}) factor cancels exactly, so no approximation is involved.
+Mirrors the `generated quantities` block in the Stan CTMC models.
 
 `n_rates`: 4 for the independent model, 8 for the dependent model.
 """
@@ -915,7 +917,13 @@ end
 
 ### LOO for CTMC models
 
-The CTMC likelihood is defined over the joint tip configuration, not as a product of per-observation terms, so PSIS-LOO is not directly applicable. However, exact leave-one-out log-likelihoods can be computed by re-running Felsenstein pruning for each tip in turn (marginalizing over its state). This is analogous to the `generated quantities` block in the Stan CTMC models. The resulting per-tip log-likelihoods are then passed to `loo()`.
+The CTMC likelihood is defined over the joint tip configuration, not as a product of per-observation terms, so PSIS-LOO is not directly applicable. However, the exact conditional log-likelihood $\log p(y_t \mid x_t, D_{-t}, Q)$ can be computed for each tip without any approximation. The key identity is:
+
+$$
+\log p(y_t \mid x_t, D_{-t}, Q) = \log p(s_t^{\text{obs}}, D_{-t} \mid Q) - \log\!\left[p(s_t^{x,0}, D_{-t} \mid Q) + p(s_t^{x,1}, D_{-t} \mid Q)\right]
+$$
+
+where $s_t^{x,y}$ denotes the joint state $(x_t, y)$. Each of the three terms is a Felsenstein pruning likelihood with tip $t$ forced to a particular state; the $p(D_{-t} \mid Q)$ factor cancels in the ratio. This mirrors the `generated quantities` block in the Stan CTMC models. The resulting per-tip log-likelihoods are passed to `loo()`.
 
 ```{julia}
 loglik_ctmc_indep = ctmc_loo_loglik(chain_ctmc_indep, tip_states_obs, ctmc_tree, d, 4)
@@ -1542,7 +1550,7 @@ Pareto-smoothed leave-one-out cross-validation and Bayes factors measure differe
 - The **Bayes factor** evaluates the full generative model (both variables). A model that better captures the joint evolutionary process is favored.
 - The **LOOIC** measures predictive accuracy for $y$ alone. It rewards models that assign high probability to each held-out observation of $y$.
 
-Note that for the CTMC models, LOO is computed exactly (by re-running Felsenstein pruning with each tip marginalized) rather than via PSIS. For the continuous models it is computed via PSIS on the per-observation log-likelihoods. Despite the different computation strategies, `loo()` treats both identically for comparison.
+Note that for the CTMC models, the per-tip conditional log-likelihoods $\log p(y_t \mid x_t, D_{-t}, Q)$ are computed exactly via the cancellation identity above (no importance sampling). For the continuous models, per-observation log-likelihoods are evaluated at the sampled latent states and then reweighted via PSIS. Despite the different computation strategies, `loo()` treats both identically for comparison.
 
 Both metrics agree: continuous latent-variable models substantially outperform the vanilla baselines, and OU outperforms Brownian motion.
 
