@@ -292,6 +292,13 @@ end
 LogDensityProblems.dimension(::CTMCDepLogDensity) = 8
 LogDensityProblems.capabilities(::Type{CTMCDepLogDensity}) = LogDensityProblems.LogDensityOrder{0}()
 
+# Pigeons needs a reference distribution with sample_iid! support.
+# DistributionLogPotential wraps a Distributions.jl type and provides both
+# log density evaluation and iid sampling. Reference = N(0,I) matches the
+# log_r ~ MvNormal(zeros, I) prior exactly, so stepping_stone = log p(data).
+Pigeons.default_reference(::CTMCIndepLogDensity) = Pigeons.DistributionLogPotential(MvNormal(zeros(4), I))
+Pigeons.default_reference(::CTMCDepLogDensity)   = Pigeons.DistributionLogPotential(MvNormal(zeros(8), I))
+
 @model function OU_regression(d, tree_info, taxa)
     N = length(taxa)
     root = tree_info.root; mothers = tree_info.mothers
