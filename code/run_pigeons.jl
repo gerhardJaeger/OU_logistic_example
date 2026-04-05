@@ -247,6 +247,51 @@ end
         ctmc_tree.root_node, ctmc_tree.n_nodes, ctmc_tree.n_tips, Q, stat)
 end
 
+# Direct LogDensityProblems implementations for CTMC models.
+# TuringLogPotential with @addlogprob! is broken in Pigeons 0.4.8 + DynamicPPL 0.31.5:
+# the likelihood term is not annealed, so stepping_stone returns ~0. Bypassing via
+# direct log density structs (prior + pruning_loglik explicitly).
+
+struct CTMCIndepLogDensity
+    tip_states::Vector{Int}
+    ctmc_tree
+end
+function LogDensityProblems.logdensity(d::CTMCIndepLogDensity, log_r::AbstractVector)
+    lr = clamp.(log_r, -8.0, 8.0)
+    r  = exp.(lr)
+    Q  = zeros(eltype(r), 4, 4)
+    Q[1,2] = r[1]; Q[1,3] = r[2]; Q[2,4] = r[2]; Q[3,4] = r[1]
+    Q[2,1] = r[3]; Q[3,1] = r[4]; Q[4,2] = r[4]; Q[4,3] = r[3]
+    for i in 1:4; Q[i,i] = -sum(Q[i,:]); end
+    stat   = stationary_dist(Q)
+    prior  = logpdf(MvNormal(zeros(4), I), log_r)
+    ll     = pruning_loglik(d.tip_states, d.ctmc_tree.edges, d.ctmc_tree.lengths,
+                 d.ctmc_tree.root_node, d.ctmc_tree.n_nodes, d.ctmc_tree.n_tips, Q, stat)
+    return prior + ll
+end
+LogDensityProblems.dimension(::CTMCIndepLogDensity) = 4
+LogDensityProblems.capabilities(::Type{CTMCIndepLogDensity}) = LogDensityProblems.LogDensityOrder{0}()
+
+struct CTMCDepLogDensity
+    tip_states::Vector{Int}
+    ctmc_tree
+end
+function LogDensityProblems.logdensity(d::CTMCDepLogDensity, log_r::AbstractVector)
+    lr    = clamp.(log_r, -8.0, 8.0)
+    rates = exp.(lr)
+    Q     = zeros(eltype(rates), 4, 4)
+    Q[1,2] = rates[1]; Q[1,3] = rates[2]; Q[2,4] = rates[3]; Q[3,4] = rates[4]
+    Q[2,1] = rates[5]; Q[3,1] = rates[6]; Q[4,2] = rates[7]; Q[4,3] = rates[8]
+    for i in 1:4; Q[i,i] = -sum(Q[i,:]); end
+    stat   = stationary_dist(Q)
+    prior  = logpdf(MvNormal(zeros(8), I), log_r)
+    ll     = pruning_loglik(d.tip_states, d.ctmc_tree.edges, d.ctmc_tree.lengths,
+                 d.ctmc_tree.root_node, d.ctmc_tree.n_nodes, d.ctmc_tree.n_tips, Q, stat)
+    return prior + ll
+end
+LogDensityProblems.dimension(::CTMCDepLogDensity) = 8
+LogDensityProblems.capabilities(::Type{CTMCDepLogDensity}) = LogDensityProblems.LogDensityOrder{0}()
+
 @model function OU_regression(d, tree_info, taxa)
     N = length(taxa)
     root = tree_info.root; mothers = tree_info.mothers
@@ -324,15 +369,17 @@ end
 
 # ─── Pigeons stepping-stone ───────────────────────────────────────────────────
 
-function pigeons_logml(model, cache_file; n_rounds=10, n_chains=5)
+function pigeons_logml(model_or_density, cache_file; n_rounds=10, n_chains=5)
     if isfile(cache_file)
         logml = load(cache_file, "logml")
         println("  [cache] ", cache_file, " -> ", round(logml, digits=3))
         return logml
     end
     println("  Running Pigeons: n_rounds=$(n_rounds), n_chains=$(n_chains)...")
+    target = model_or_density isa DynamicPPL.Model ?
+        TuringLogPotential(model_or_density) : model_or_density
     pt = pigeons(
-        target   = TuringLogPotential(model),
+        target   = target,
         n_rounds = n_rounds,
         n_chains = n_chains,
     )
@@ -357,12 +404,12 @@ lg_vc = pigeons_logml(
 
 println("\n3. CTMC independent (n_rounds=10, n_chains=10)")
 lg_ci = pigeons_logml(
-    ctmc_independent(tip_states_obs, ctmc_tree),
+    CTMCIndepLogDensity(tip_states_obs, ctmc_tree),
     "cache/pigeons_ctmc_indep.jld2"; n_rounds=10, n_chains=10)
 
 println("\n4. CTMC dependent (n_rounds=10, n_chains=10)")
 lg_cd = pigeons_logml(
-    ctmc_dependent(tip_states_obs, ctmc_tree),
+    CTMCDepLogDensity(tip_states_obs, ctmc_tree),
     "cache/pigeons_ctmc_dep.jld2"; n_rounds=10, n_chains=10)
 
 println("   Log BF (indep vs dep): ", lg_ci - lg_cd)
